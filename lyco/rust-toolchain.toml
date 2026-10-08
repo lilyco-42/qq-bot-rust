@@ -1,0 +1,5 @@
+# wtx 使用未稳定的 #![feature(random, return_type_notation)]，必须 nightly。
+# 本地已安装 nightly-x86_64-pc-windows-msvc，rustup 进入本目录自动选择。
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy"]

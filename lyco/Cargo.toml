@@ -1,0 +1,18 @@
+[package]
+name = "qq_bot_rust"
+version = "0.1.0"
+edition = "2024"
+description = "QQ 机器人 OpenAPI SDK：no_std + alloc 核心，wtx 生态传输层，针对 botgo issue #61 反模式加固"
+keywords = ["qq", "bot", "openapi", "no-std"]
+categories = ["api-bindings", "no-std", "network-programming"]
+
+[dependencies]
+# wtx 生态（no_std + alloc，传输/HTTP/TLS/WebSocket 按 feature 渐进启用）。
+# 注意：wtx 需要 nightly（#![feature(random, return_type_notation)]），见 rust-toolchain.toml。
+wtx = { version = "0.52.1", default-features = false }
+# Ed25519（webhook 回调验签/握手签名）；与 wtx crypto-ruco 后端同源，后续并轨。
+ed25519-dalek = { version = "3", default-features = false }
+
+# wtx 的 HTTP/传输层能力在后续里程碑接入，此前允许"依赖未被引用"告警。
+[lints.cargo]
+unused_dependencies = "allow"

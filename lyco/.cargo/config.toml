@@ -1,0 +1,19 @@
+[profile.dev] # cargo-xmake
+codegen-units = 16 # cargo-xmake
+overflow-checks = false # cargo-xmake
+debug-assertions = true # cargo-xmake
+opt-level = 0 # cargo-xmake
+incremental = true # cargo-xmake
+strip = "debuginfo" # cargo-xmake
+debug = false # cargo-xmake
+
+[profile.release] # cargo-xmake
+incremental = false # cargo-xmake
+strip = "symbols" # cargo-xmake
+panic = "abort" # cargo-xmake
+codegen-units = 1 # cargo-xmake
+lto = "fat" # cargo-xmake
+opt-level = 3 # cargo-xmake
+
+[target.x86_64-pc-windows-msvc] # cargo-xmake
+rustflags = ["-Clink-args=/DEBUG:NONE"] # cargo-xmake
