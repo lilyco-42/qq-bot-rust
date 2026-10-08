@@ -5,22 +5,31 @@
 //! - op=13 回调握手：应答 `{plain_token, signature}`，保存回调地址即通过校验；
 //! - op=0 事件推送：`X-Signature-Ed25519` + `X-Signature-Timestamp` 验签通过才上抛
 //!   （打印事件正文），失败回 403 并记录原因——不吞错、不 panic；
-//! - 凭证只从环境变量 `QQ_BOT_SECRET` 读入 [`SecretString`]，永不进日志。
+//! - 消息类事件验签通过后，先回 200 再异步被动回复（AppAccessToken 缓存 +
+//!   OpenAPI 发送，协议层在 `qq_bot_rust::api`，指令层在 `qq_bot_rust::commands`）；
+//! - 凭证只从环境变量 `QQ_BOT_SECRET` 读入 [`SecretString`]，永不进日志；
+//!   token 仅在构造 `Authorization` 头的 `expose()` 审计点取明文。
 //!
 //! 环境变量：
 //!
 //! | 变量 | 默认值 | 说明 |
 //! |------|--------|------|
 //! | `QQ_BOT_SECRET` | （必填） | 机器人 secret（运行时注入，不入库） |
-//! | `QQ_APPID` | — | 仅用于启动日志展示 |
+//! | `QQ_APPID` | — | 应用 AppID；缺省时只收事件、不回复（启动时告警） |
 //! | `WEBHOOK_BIND` | `0.0.0.0:8080` | 监听地址 |
 //! | `WEBHOOK_PRINT_EVENTS` | `1` | 是否打印已验签事件的原始报文 |
+//! | `WEBHOOK_REPLY` | `1` | 是否启用被动回复（`0` 关闭） |
 
+use qq_bot_rust::api;
 use qq_bot_rust::callback::{self, OP_CHALLENGE, OP_EVENT};
+use qq_bot_rust::commands::{self, Reply as CommandReply};
 use qq_bot_rust::crypto::webhook::{derive_public_key, verify_callback};
+use qq_bot_rust::error::Error as LibError;
+use qq_bot_rust::event;
 use qq_bot_rust::secret::SecretString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 请求头缓冲上限（QQ 回调头远小于此值）。
@@ -39,11 +48,86 @@ const HEADER_SIG_ED25519: &str = "X-Signature-Ed25519";
 /// 事件验签时间戳头。
 const HEADER_SIG_TIMESTAMP: &str = "X-Signature-Timestamp";
 
-/// 服务配置（每连接克隆一份，无共享可变状态）。
+/// token 缓存刷新提前量（官方：过期前 60s 内获取会签发新 token）。
+const TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
+
+/// 服务配置（每连接克隆一份；token 缓存经 `Arc<Mutex<..>>` 共享）。
 #[derive(Clone)]
 struct Config {
     secret: SecretString,
     print_events: bool,
+    /// 应用 AppID；`None` = 无回复能力（启动日志告警）。
+    app_id: Option<String>,
+    /// 是否启用被动回复（`WEBHOOK_REPLY`）。
+    reply_enabled: bool,
+    /// 出站 HTTP 客户端（连接池共享；`Agent` 内部为 `Arc`，克隆廉价）。
+    agent: ureq::Agent,
+    /// AppAccessToken 缓存（互斥锁内仅做指针级存取，网络 I/O 不持锁）。
+    token: Arc<Mutex<Option<CachedToken>>>,
+}
+
+/// 缓存的 AppAccessToken 及其绝对过期时刻（unix 秒）。
+struct CachedToken {
+    token: SecretString,
+    expires_at_unix: i64,
+}
+
+impl Config {
+    /// 是否具备回复条件（开关打开且 AppID 存在）。
+    fn can_reply(&self) -> bool {
+        self.reply_enabled
+            && self
+                .app_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+    }
+}
+
+/// 一次被动回复的全部要素（[`plan_reply`] 的产物）。
+struct ReplyJob {
+    /// 目标是否为群聊（`true` 群 / `false` 单聊）。
+    is_group: bool,
+    /// 回复目标 openid（群 openid 或用户 openid）。
+    openid: String,
+    /// 被回复消息 id（`d.id`）。
+    msg_id: String,
+    /// 事件类型（日志标签）。
+    event_type: String,
+    /// 回复正文。
+    text: String,
+}
+
+impl ReplyJob {
+    /// 日志用目标标签。
+    fn target_label(&self) -> &'static str {
+        if self.is_group { "group" } else { "c2c" }
+    }
+}
+
+/// 出站失败分类（排障日志 + 401 有界重试判定）。
+enum SendError {
+    /// 传输层失败（DNS/超时/TLS 连接）。
+    Transport(String),
+    /// 协议层错误（业务错误码、HTTP 状态兜底、应答解析失败）。
+    Api(LibError),
+    /// 运行时配置缺失（如未设置 `QQ_APPID`）。
+    Config(String),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(reason) => write!(f, "transport error: {reason}"),
+            Self::Api(err) => write!(f, "{err}"),
+            Self::Config(reason) => write!(f, "config error: {reason}"),
+        }
+    }
+}
+
+impl From<LibError> for SendError {
+    fn from(err: LibError) -> Self {
+        Self::Api(err)
+    }
 }
 
 /// 已解析的 HTTP 请求（拥有所需字段）。
@@ -109,11 +193,25 @@ fn run() -> Result<(), String> {
     if secret_value.is_empty() {
         return Err("QQ_BOT_SECRET 环境变量为空".to_string());
     }
+    let app_id = std::env::var("QQ_APPID")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let reply_enabled = std::env::var("WEBHOOK_REPLY")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let config = Config {
         secret: SecretString::new(secret_value),
         print_events: std::env::var("WEBHOOK_PRINT_EVENTS")
             .map(|value| value != "0")
             .unwrap_or(true),
+        app_id,
+        reply_enabled,
+        agent: ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(IO_TIMEOUT)
+            .timeout_write(IO_TIMEOUT)
+            .build(),
+        token: Arc::new(Mutex::new(None)),
     };
     let bind = std::env::var("WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
@@ -122,16 +220,24 @@ fn run() -> Result<(), String> {
         .local_addr()
         .map_err(|err| format!("读取监听地址失败: {err}"))?;
 
+    if config.reply_enabled && !config.can_reply() {
+        logln(
+            "WARN",
+            "QQ_APPID 未设置：事件只打印，不发送被动回复（WEBHOOK_REPLY=0 可消除本告警）",
+        );
+    }
+
     // 公钥非机密：启动时打印，供与开放平台控制台展示的公钥比对。
     let pubkey = derive_public_key(config.secret.expose())
         .map_err(|err| format!("派生机器人公钥失败: {err}"))?;
     logln(
         "INFO",
         &format!(
-            "webhook server listening on {local} appid={} pubkey={} print_events={}",
-            std::env::var("QQ_APPID").unwrap_or_else(|_| "-".to_string()),
+            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={}",
+            config.app_id.as_deref().unwrap_or("-"),
             hex_encode(&pubkey),
             config.print_events,
+            config.can_reply(),
         ),
     );
 
@@ -365,6 +471,11 @@ fn handle_webhook(config: &Config, request: &HttpRequest) -> Reply {
                     if config.print_events {
                         logln("EVENT", &sanitize_text(&request.body, LOG_BODY_CAP));
                     }
+                    // 消息类事件：先回 200（平台 5s 重试窗口），再异步被动回复。
+                    // 工作线程内部自行分流：非消息事件/无可回正文直接退出。
+                    if config.can_reply() {
+                        spawn_reply(config.clone(), request.body.clone());
+                    }
                     Reply::json(200, "OK", "{}".to_string())
                 }
                 Err(err) => {
@@ -390,6 +501,211 @@ fn handle_webhook(config: &Config, request: &HttpRequest) -> Reply {
             Reply::json(200, "OK", "{}".to_string())
         }
     }
+}
+
+// ——— 被动回复链路：先回 200，再异步发送 ————————————————————
+
+/// 从已验签事件字节规划回复任务（纯函数，便于单测）。
+///
+/// - 无 `t` / 非消息类事件 → `Ok(None)`（正常分流，不是错误）；
+/// - 消息事件但结构非法 → `Err`（上抛，由工作线程记 WARN，不吞）；
+/// - 正文为空或指令返回 [`Reply::Skip`] → `Ok(None)`（无可回内容）。
+fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob>, LibError> {
+    let Some(event_type) = event::event_type(body)? else {
+        return Ok(None);
+    };
+    if !event::is_message_event(&event_type) {
+        return Ok(None);
+    }
+    let parsed = event::parse_message_event(body, &event_type)?;
+    let (is_group, openid) = match (&parsed.group_openid, &parsed.user_openid) {
+        (Some(group), _) => (true, group.clone()),
+        (None, Some(user)) => (false, user.clone()),
+        // parse_message_event 已保证至少一个目标；此处保持严格，不 unwrap。
+        (None, None) => return Err(LibError::NoReplyTarget),
+    };
+    let text = match commands::dispatch(&parsed.content, now_unix, random)? {
+        CommandReply::Text(text) => text,
+        CommandReply::Skip => return Ok(None),
+    };
+    Ok(Some(ReplyJob {
+        is_group,
+        openid,
+        msg_id: parsed.msg_id,
+        event_type: parsed.event_type,
+        text,
+    }))
+}
+
+/// 派生工作线程执行回复（spawn 失败仅告警，不影响已回的 200）。
+fn spawn_reply(config: Config, body: Vec<u8>) {
+    let spawned = std::thread::Builder::new()
+        .name("reply-worker".to_string())
+        .spawn(move || reply_worker(config, body));
+    if let Err(err) = spawned {
+        logln("WARN", &format!("spawn reply worker failed: {err}"));
+    }
+}
+
+/// 回复工作线程：规划 → 发送（仅 401 强刷重试一次）→ 记录结果。
+fn reply_worker(config: Config, body: Vec<u8>) {
+    let job = match plan_reply(&body, unix_now(), mix_random()) {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(err) => {
+            logln("WARN", &format!("reply skipped, event parse failed: {err}"));
+            return;
+        }
+    };
+    let outcome = match send_reply(&config, &job, false) {
+        Ok(reply_id) => Ok(reply_id),
+        // 401 = 凭证失效/过期：强刷 token 后有界重试一次（绝不循环）。
+        Err(err @ SendError::Api(LibError::Api(401))) => {
+            logln(
+                "INFO",
+                &format!("reply got 401, refreshing token and retrying once: {err}"),
+            );
+            send_reply(&config, &job, true)
+        }
+        Err(err) => Err(err),
+    };
+    let label = sanitize_text(job.event_type.as_bytes(), 48);
+    match outcome {
+        Ok(reply_id) => logln(
+            "INFO",
+            &format!(
+                "reply sent event={label} target={} reply_id={} text_bytes={}",
+                job.target_label(),
+                sanitize_text(reply_id.as_bytes(), 64),
+                job.text.len(),
+            ),
+        ),
+        Err(err) => logln(
+            "WARN",
+            &format!(
+                "reply failed event={label} target={}: {err}",
+                job.target_label()
+            ),
+        ),
+    }
+}
+
+/// 发送一次回复：取 token → 构造请求 → POST → 解析回执。
+fn send_reply(config: &Config, job: &ReplyJob, force_refresh: bool) -> Result<String, SendError> {
+    let token = ensure_token(config, force_refresh)?;
+    let request = api::send_message_request(job.is_group, &job.openid, &job.text, &job.msg_id, 1)?;
+    let (status, body) = post_json(&config.agent, &request, Some(&token))?;
+    Ok(api::parse_send_response(status, &body)?.id)
+}
+
+/// 取可用 AppAccessToken：命中缓存直接返回，否则向平台换取并写回。
+///
+/// 命中条件 `now + 60s < expires_at`（官方：过期前 60s 内获取会签发新
+/// token）。网络 I/O 不持锁：并发未命中的线程可能重复换取，平台在有效期内
+/// 返回同一 token，属良性重复，无共享状态竞争。
+fn ensure_token(config: &Config, force_refresh: bool) -> Result<SecretString, SendError> {
+    let now = unix_now();
+    if !force_refresh && let Some(cached) = cached_token(config, now) {
+        return Ok(cached);
+    }
+    let app_id = config
+        .app_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SendError::Config("QQ_APPID 未设置".to_string()))?;
+    let request = api::app_token_request(app_id, config.secret.expose());
+    let (status, body) = post_json(&config.agent, &request, None)?;
+    let parsed = api::parse_app_token(status, &body)?;
+    // saturating：恶意/异常 expires_in 不得溢出 panic；非正值等价于不缓存。
+    let expires_at = now.saturating_add(parsed.expires_in.max(0));
+    store_token(config, parsed.token.clone(), expires_at);
+    // 只记有效期，不记 token 本体。
+    logln(
+        "INFO",
+        &format!("access_token refreshed expires_in={}s", parsed.expires_in),
+    );
+    Ok(parsed.token)
+}
+
+/// 读 token 缓存（锁中毒时取回内部值继续，绝不 panic）。
+fn cached_token(config: &Config, now: i64) -> Option<SecretString> {
+    let guard = match config.token.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let cached = guard.as_ref()?;
+    if now + TOKEN_REFRESH_MARGIN_SECS < cached.expires_at_unix {
+        Some(cached.token.clone())
+    } else {
+        None
+    }
+}
+
+/// 写 token 缓存（锁中毒时取回内部值继续，绝不 panic）。
+fn store_token(config: &Config, token: SecretString, expires_at_unix: i64) {
+    let mut guard = match config.token.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(CachedToken {
+        token,
+        expires_at_unix,
+    });
+}
+
+/// POST JSON（传输层）：返回 `(status, body)`；判定交给协议层。
+///
+/// - `token` 存在时附加 `Authorization: QQBot {token}`（`expose()` 审计点）；
+/// - 非 2xx 在 ureq 中表现为 [`ureq::Error::Status`]，其 body 仍是应答
+///   内容，照常交协议层按 `err_code`/`code` 判定（不因非 2xx 丢信息）。
+fn post_json(
+    agent: &ureq::Agent,
+    request: &api::ApiRequest,
+    token: Option<&SecretString>,
+) -> Result<(u16, String), SendError> {
+    let mut builder = agent
+        .post(&request.url)
+        .set("Content-Type", "application/json; charset=utf-8");
+    if let Some(token) = token {
+        builder = builder.set("Authorization", &format!("QQBot {}", token.expose()));
+    }
+    match builder.send_string(&request.body) {
+        Ok(response) => {
+            let status = response.status();
+            let text = response
+                .into_string()
+                .map_err(|err| SendError::Transport(format!("read response body: {err}")))?;
+            Ok((status, text))
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Ok((status, text))
+        }
+        Err(other) => Err(SendError::Transport(other.to_string())),
+    }
+}
+
+/// 当前 unix 秒（时钟异常回退 0，不 panic）。
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 混合随机源：时间纳秒 ^ 原子计数器，经 splitmix64 扩散（无全局可变状态风险）。
+fn mix_random() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut mixed = nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
 }
 
 /// 写出 HTTP 应答（短连接：`Connection: close`）。
@@ -457,11 +773,15 @@ fn logln(level: &str, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, HttpRequest, handle_client, process};
+    use super::{
+        Config, HttpRequest, cached_token, handle_client, plan_reply, process, store_token,
+    };
     use qq_bot_rust::crypto::webhook::{derive_seed, sign_challenge};
+    use qq_bot_rust::error::Error as LibError;
     use qq_bot_rust::secret::SecretString;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     /// 官方《Webhook 方式》演示 secret。
     const DOC_SECRET: &str = "DG5g3B4j9X2KOErG";
@@ -470,6 +790,11 @@ mod tests {
         Config {
             secret: SecretString::new(DOC_SECRET),
             print_events: true,
+            // 测试配置不触发网络：无 AppID → can_reply() == false。
+            app_id: None,
+            reply_enabled: true,
+            agent: ureq::AgentBuilder::new().build(),
+            token: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -608,5 +933,94 @@ mod tests {
         let expected = sign_challenge(DOC_SECRET, "1725442341", "Arq0D5A61EgUu4OxUvOp").unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "resp={response}");
         assert!(response.contains(&expected), "resp={response}");
+    }
+
+    /// 真实单聊事件报文（Radxa 抓取；中文按 UTF-8 字节转义）。
+    const C2C_HELP_EVENT: &[u8] = b"{\"op\":0,\"id\":\"C2C_MESSAGE_CREATE:sfyoo42bh\",\"d\":{\"id\":\"ROBOT1.0_oC3JDEal\",\"content\":\"\xe5\xb8\xae\xe5\x8a\xa9\",\"timestamp\":\"2026-10-09T00:22:29+08:00\",\"author\":{\"id\":\"DE8C8AEC\",\"username\":\"\",\"bot\":false,\"user_openid\":\"DE8C8AECAF13F8D144240291E8D7B0A7\",\"union_openid\":\"\"},\"message_type\":0},\"t\":\"C2C_MESSAGE_CREATE\",\"seq\":1}";
+
+    /// 真实群事件报文（成员进群；无正文、无消息 id → 不属于消息事件）。
+    const GROUP_MEMBER_ADD: &[u8] = b"{\"op\":0,\"id\":\"GROUP_MEMBER_ADD:x\",\"d\":{\"timestamp\":\"2026-10-09T00:19:16+08:00\",\"group_openid\":\"3D54AA8E\",\"member_openid\":\"095AF6EF\"},\"t\":\"GROUP_MEMBER_ADD\",\"seq\":3}";
+
+    #[test]
+    fn plan_reply_targets_c2c_for_help_command() {
+        let job = plan_reply(C2C_HELP_EVENT, 1_791_476_549, 0)
+            .unwrap()
+            .expect("帮助 must plan a reply");
+        assert!(!job.is_group);
+        assert_eq!(job.openid, "DE8C8AECAF13F8D144240291E8D7B0A7");
+        assert_eq!(job.msg_id, "ROBOT1.0_oC3JDEal");
+        assert_eq!(job.event_type, "C2C_MESSAGE_CREATE");
+        assert!(job.text.contains("可用指令"), "text={}", job.text);
+    }
+
+    #[test]
+    fn plan_reply_targets_group_and_answers_unknown_command() {
+        let body = b"{\"op\":0,\"id\":\"GROUP_AT_MESSAGE_CREATE:g\",\"d\":{\"author\":{\"id\":\"79BE\",\"user_openid\":\"79BE66EF\"},\"content\":\"123\",\"group_openid\":\"3D54AA8E\",\"id\":\"ROBOT1.0_grp\",\"message_type\":0},\"t\":\"GROUP_AT_MESSAGE_CREATE\",\"seq\":1}";
+        let job = plan_reply(body, 0, 0)
+            .unwrap()
+            .expect("group @ message must plan a reply");
+        assert!(job.is_group);
+        assert_eq!(job.openid, "3D54AA8E");
+        assert_eq!(job.msg_id, "ROBOT1.0_grp");
+        // 未知指令不装死。
+        assert!(job.text.contains("帮助"), "text={}", job.text);
+    }
+
+    #[test]
+    fn plan_reply_skips_non_message_and_empty_content() {
+        // 非消息事件（群成员进群）：正常分流，不是错误。
+        assert!(plan_reply(GROUP_MEMBER_ADD, 0, 0).unwrap().is_none());
+        // 无 t（如握手报文）：同样不回复。
+        assert!(plan_reply(br#"{"op":13,"d":{}}"#, 0, 0).unwrap().is_none());
+        // 空正文（媒体消息）：无文本可回。
+        let body = b"{\"d\":{\"id\":\"m\",\"content\":\"\",\"author\":{\"user_openid\":\"u\"}},\"t\":\"C2C_MESSAGE_CREATE\"}";
+        assert!(plan_reply(body, 0, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_reply_propagates_structural_errors() {
+        // 消息事件缺 d.id → 错误上抛（由工作线程记 WARN，不吞）。
+        let body =
+            b"{\"d\":{\"content\":\"\xe5\xb8\xae\xe5\x8a\xa9\"},\"t\":\"C2C_MESSAGE_CREATE\"}";
+        assert_eq!(
+            plan_reply(body, 0, 0).err(),
+            Some(LibError::MissingField("d.id"))
+        );
+        // 无回复目标。
+        let body = b"{\"d\":{\"id\":\"m\",\"content\":\"hi\"},\"t\":\"C2C_MESSAGE_CREATE\"}";
+        assert_eq!(plan_reply(body, 0, 0).err(), Some(LibError::NoReplyTarget));
+    }
+
+    #[test]
+    fn token_cache_enforces_refresh_margin() {
+        let config = config();
+        // 空缓存。
+        assert!(cached_token(&config, 1_000).is_none());
+        // 有效期内命中明文。
+        store_token(&config, SecretString::new("tok".to_string()), 8_200);
+        assert_eq!(
+            cached_token(&config, 1_000).map(|token| token.expose().to_string()),
+            Some("tok".to_string())
+        );
+        // 进入 60s 刷新窗口 → 视为过期，触发重取。
+        assert!(cached_token(&config, 8_200 - 60).is_none());
+        assert!(cached_token(&config, 8_200).is_none());
+        // 非正值有效期 → 永不命中。
+        store_token(&config, SecretString::new("tok".to_string()), 1_000);
+        assert!(cached_token(&config, 1_000).is_none());
+    }
+
+    #[test]
+    fn reply_requires_appid_and_switch() {
+        let mut config = config();
+        // 测试配置无 AppID → 不派生线程、不发网络请求。
+        assert!(!config.can_reply());
+        config.app_id = Some("1903680813".to_string());
+        assert!(config.can_reply());
+        config.reply_enabled = false;
+        assert!(!config.can_reply());
+        config.reply_enabled = true;
+        config.app_id = Some(String::new());
+        assert!(!config.can_reply());
     }
 }

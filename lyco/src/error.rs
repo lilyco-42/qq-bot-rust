@@ -27,6 +27,13 @@ pub enum Error {
     MissingField(&'static str),
     /// 回调 op 与预期不符（如对非 13 的报文执行握手处理）。
     UnexpectedOp(i64),
+    /// OpenAPI 业务错误码（平台可能以 HTTP 200 携带 `code`/`err_code` 返回，
+    /// 必须按码判定；HTTP 状态码兜底时也用本变种承载）。
+    Api(i64),
+    /// 事件类型不是可回复的消息类事件（调用方应先经 `is_message_event` 过滤）。
+    NotMessageEvent,
+    /// 消息事件缺少回复目标（`d.group_openid` 与 `d.author.user_openid` 皆缺）。
+    NoReplyTarget,
 }
 
 impl fmt::Display for Error {
@@ -40,6 +47,9 @@ impl fmt::Display for Error {
             Self::MalformedJson => f.write_str("malformed webhook payload JSON"),
             Self::MissingField(field) => write!(f, "webhook payload missing field: {field}"),
             Self::UnexpectedOp(op) => write!(f, "unexpected webhook op: {op}"),
+            Self::Api(code) => write!(f, "openapi error code: {code}"),
+            Self::NotMessageEvent => f.write_str("event type is not a replyable message event"),
+            Self::NoReplyTarget => f.write_str("message event has no reply target openid"),
         }
     }
 }

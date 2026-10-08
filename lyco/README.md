@@ -24,8 +24,12 @@ QQ 机器人 OpenAPI SDK —— `no_std + alloc` 核心，wtx 生态传输层，
 - [x] **真实平台端到端验收（2026-10-09）**：开放平台控制台切换 WebSocket→Webhook
   时 op=13 挑战签名被平台验证通过；用户私聊消息经公网隧道推送至 Radxa A7a，
   `event verified` + EVENT 日志打印（`C2C_MESSAGE_CREATE` / `GROUP_MEMBER_ADD`）
-- [ ] AppAccessToken 获取与自动续期（错误上抛、凭证脱敏）
-- [ ] OpenAPI endpoint（消息收发起步）
+- [x] AppAccessToken 获取与自动续期（`api.rs` + bin 内 `Arc<Mutex>` 缓存，
+  60s 刷新余量、锁不跨 IO、仅 401 强制刷新重试一次；凭证脱敏）
+- [x] 消息收发：`event.rs` 解析 C2C/群消息事件 → `commands.rs` 指令分发 →
+  OpenAPI 被动回复（`POST /v2/users|groups/{openid}/messages`）；
+  webhook 200 先行 ACK、工作线程发送；`cargo test` 56 项全绿
+- [ ] 问答与更多指令（zerostack 单发问答、`/` 指令前缀）
 - [ ] WebSocket 兼容链路（官方已宣布下线，仅作过渡）
 
 ## Radxa 部署（aarch64，验收现场）

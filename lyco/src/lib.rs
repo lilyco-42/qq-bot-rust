@@ -19,9 +19,12 @@
 
 extern crate alloc;
 
+pub mod api;
 pub mod callback;
+pub mod commands;
 pub mod crypto;
 pub mod error;
+pub mod event;
 pub mod secret;
 
 pub use error::{Error, Result};

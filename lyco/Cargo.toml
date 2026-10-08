@@ -15,6 +15,11 @@ ed25519-dalek = { version = "3", default-features = false }
 # HTTP/1.1 报文解析（wtx 同款解析器；wtx 未对外 re-export，故直接依赖）。
 # no_std 兼容（default-features = false），仅接收端 bin 使用。
 httparse = { version = "1.0", default-features = false }
+# 出站 HTTPS 客户端（同步、rustls + webpki-roots 内置根证书）。
+# 选型记录：wtx 的 TLS/客户端以异步执行器为中心（TlsConnectorBuilder::build
+# 为 async，且需自行接线证书库），与接收端 bin 的 std 线程模型不匹配；
+# 沿用 httparse 先例引入最小直接依赖，仅 bin 使用。
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 # wtx 的 HTTP/传输层能力在后续里程碑接入，此前允许"依赖未被引用"告警。
 [lints.cargo]
