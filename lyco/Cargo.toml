@@ -12,6 +12,9 @@ categories = ["api-bindings", "no-std", "network-programming"]
 wtx = { version = "0.52.1", default-features = false }
 # Ed25519（webhook 回调验签/握手签名）；与 wtx crypto-ruco 后端同源，后续并轨。
 ed25519-dalek = { version = "3", default-features = false }
+# HTTP/1.1 报文解析（wtx 同款解析器；wtx 未对外 re-export，故直接依赖）。
+# no_std 兼容（default-features = false），仅接收端 bin 使用。
+httparse = { version = "1.0", default-features = false }
 
 # wtx 的 HTTP/传输层能力在后续里程碑接入，此前允许"依赖未被引用"告警。
 [lints.cargo]

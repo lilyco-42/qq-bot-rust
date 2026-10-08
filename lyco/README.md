@@ -14,12 +14,37 @@ QQ 机器人 OpenAPI SDK —— `no_std + alloc` 核心，wtx 生态传输层，
 
 ## 状态
 
-- [x] 骨架 + webhook Ed25519 验签 / 回调握手签名（11 测试全绿：单测 10 + doctest 1；
-  `cargo fmt` 与 `cargo clippy -- -D warnings` 干净）
+- [x] 骨架 + webhook Ed25519 验签 / 回调握手签名
+- [x] 回调报文最小解析 `callback.rs`（op/字段提取，严格失败；单测覆盖转义、
+  字符串内同名文本、截断等边界）
+- [x] Webhook 服务端 `src/bin/webhook_server.rs`（std 运行时；手搓 HTTP/1.1
+  解析 = wtx `httparse` feature 同款解析器直依赖——wtx 未对外 re-export，
+  且其 Cargo.toml 无 HTTP/1.1 服务端框架；每连接一线程、读写超时、
+  零 panic、`QQ_BOT_SECRET` 只经环境变量注入 `SecretString`）
+- [x] **真实平台端到端验收（2026-10-09）**：开放平台控制台切换 WebSocket→Webhook
+  时 op=13 挑战签名被平台验证通过；用户私聊消息经公网隧道推送至 Radxa A7a，
+  `event verified` + EVENT 日志打印（`C2C_MESSAGE_CREATE` / `GROUP_MEMBER_ADD`）
 - [ ] AppAccessToken 获取与自动续期（错误上抛、凭证脱敏）
 - [ ] OpenAPI endpoint（消息收发起步）
-- [ ] Webhook 服务端（wtx HTTP server + 事件分发）
 - [ ] WebSocket 兼容链路（官方已宣布下线，仅作过渡）
+
+## Radxa 部署（aarch64，验收现场）
+
+```sh
+# 交叉编译（静态 musl）
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+# 部署：scp target/aarch64-unknown-linux-musl/release/webhook_server radxa@192.168.10.165:qq_bot/
+# 凭证注入（env.sh，chmod 600，绝不进 ps 命令行/仓库）：
+#   export QQ_BOT_SECRET=...  export WEBHOOK_BIND=0.0.0.0:8080  export QQ_APPID=...
+# 启动（fd 全脱离，ssh 会话不挂起）：
+nohup sh -c 'cd ~/qq_bot && set -a && . ./env.sh && set +a && exec ./webhook_server >> server.log 2>&1' </dev/null >/dev/null 2>&1 &
+# 公网回调（无公网 IP 时的 cloudflared 快速隧道，URL 每次重启变化，需回控制台重配）：
+nohup sh -c 'cd ~/qq_bot && ./cloudflared tunnel --url http://127.0.0.1:8080 >> tunnel.log 2>&1' </dev/null >/dev/null 2>&1 &
+```
+
+- 回调地址：控制台 → 开发设置 → 事件订阅与回调 → 回调地址（HTTPS，仅 80/443/8080/8443）；
+- 自测工具：`SIGN_SECRET=... SIGN_TS=... SIGN_BODY='...' cargo run --example sign_event`
+  生成事件签名，可离线复验整条公网推送链。
 
 ## 预研结论（已验证的官方文档坑）
 

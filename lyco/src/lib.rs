@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+pub mod callback;
 pub mod crypto;
 pub mod error;
 pub mod secret;

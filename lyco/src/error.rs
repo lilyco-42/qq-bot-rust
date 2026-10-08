@@ -21,6 +21,12 @@ pub enum Error {
     EmptySecret,
     /// 底层密码学运算失败，携带静态原因描述。
     Crypto(&'static str),
+    /// 回调报文 JSON 形态非法（截断、值类型不符、含转义、非 UTF-8）。
+    MalformedJson,
+    /// 回调报文缺少必需字段，携带字段名。
+    MissingField(&'static str),
+    /// 回调 op 与预期不符（如对非 13 的报文执行握手处理）。
+    UnexpectedOp(i64),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +37,9 @@ impl fmt::Display for Error {
             Self::MalformedSignature => f.write_str("malformed ed25519 signature"),
             Self::EmptySecret => f.write_str("bot secret must not be empty"),
             Self::Crypto(reason) => write!(f, "cryptographic error: {reason}"),
+            Self::MalformedJson => f.write_str("malformed webhook payload JSON"),
+            Self::MissingField(field) => write!(f, "webhook payload missing field: {field}"),
+            Self::UnexpectedOp(op) => write!(f, "unexpected webhook op: {op}"),
         }
     }
 }
