@@ -29,7 +29,12 @@ QQ 机器人 OpenAPI SDK —— `no_std + alloc` 核心，wtx 生态传输层，
 - [x] 消息收发：`event.rs` 解析 C2C/群消息事件 → `commands.rs` 指令分发 →
   OpenAPI 被动回复（`POST /v2/users|groups/{openid}/messages`）；
   webhook 200 先行 ACK、工作线程发送；`cargo test` 56 项全绿
-- [ ] 问答与更多指令（zerostack 单发问答、`/` 指令前缀）
+- [x] 斜杠指令 + AI 问答（`commands.rs`：仅 `/` 前缀识别指令（无点号）、未知指令
+  与裸 `/` 回提示指向 `/帮助`、非指令正文 → `Reply::Ask`；bin 侧 spawn
+  `ZEROSTACK_BIN --no-tools --no-context-files --no-session --no-color -p` 单发问答：
+  双线程排空 stdout/stderr、50ms 轮询到超时 kill、ANSI/控制字符清洗、
+  按字数截断（平台无公开上限，保守可配）；未启用/失败回显式兜底文案不装死；
+  `cargo test` 61 项全绿）
 - [ ] WebSocket 兼容链路（官方已宣布下线，仅作过渡）
 
 ## Radxa 部署（aarch64，验收现场）
@@ -40,6 +45,15 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 # 部署：scp target/aarch64-unknown-linux-musl/release/webhook_server radxa@192.168.10.165:qq_bot/
 # 凭证注入（env.sh，chmod 600，绝不进 ps 命令行/仓库）：
 #   export QQ_BOT_SECRET=...  export WEBHOOK_BIND=0.0.0.0:8080  export QQ_APPID=...
+#   export NIM_API_KEY=...          # AI 问答免费模型 key（同上，不进仓库/日志）
+#   export ZEROSTACK_BIN=~/qq_bot/zerostack_wrap.sh
+# 可选：WEBHOOK_QA=0 关问答；QA_TIMEOUT_SECS（默认120，5..=600）；QA_MAX_CHARS（默认1000，50..=4000）
+# AI 问答（zerostack v1.8.4，aarch64-musl 静态单二进制 → ~/.local/bin/）：
+#   ~/.config/zerostack/config.toml            # provider=nim（NIM 免费 deepseek 闪光模型）
+#   ~/.local/share/zerostack/prompts/qqbot.md  # 回答风格 prompt（首行 %%mode=readonly）
+#   zerostack_wrap.sh                          # 出口包装：NIM 推理接口从 Radxa 直连挂起
+#     （GET/错误响应正常、有效模型 POST 无响应），仅对 zerostack 设 HTTPS_PROXY 走
+#     局域网代理；webhook_server/cloudflared 不继承，代理不可达时问答优雅降级
 # 启动（fd 全脱离，ssh 会话不挂起）：
 nohup sh -c 'cd ~/qq_bot && set -a && . ./env.sh && set +a && exec ./webhook_server >> server.log 2>&1' </dev/null >/dev/null 2>&1 &
 # 公网回调（无公网 IP 时的 cloudflared 快速隧道，URL 每次重启变化，需回控制台重配）：

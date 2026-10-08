@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 /// 时间源：注入 unix 秒，库内不读时钟。
 pub type Clock = i64;
@@ -16,6 +16,8 @@ pub type Clock = i64;
 pub enum Reply {
     /// 需要回复的文本。
     Text(String),
+    /// 需要 AI 问答的正文（非 `/` 指令的普通消息，问题原样携带）。
+    Ask(String),
     /// 不需要回复（如空内容、无法构成回复的输入）。
     Skip,
 }
@@ -23,17 +25,23 @@ pub enum Reply {
 /// 分发一条消息正文，产出回复。
 ///
 /// - 空/纯空白正文 → [`Reply::Skip`]（媒体消息等无文本场景，无话可回）；
-/// - 未知指令 → 短提示（显式回应，不是吞错；避免机器人装死）；
+/// - `/` 前缀 → 指令；未知 `/xxx` → 短提示（显式回应，不是吞错；
+///   避免机器人装死）；
+/// - 其余正文 → [`Reply::Ask`]，由调用方路由到 AI 问答（零栈单次问答）；
 /// - `clock`/`random` 为调用方注入的时钟与随机源，库内无全局状态。
 pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
     let text = content.trim();
     if text.is_empty() {
         return Ok(Reply::Skip);
     }
-    // 指令 = 首个空白分隔 token。
-    let (head, rest) = match text.find(char::is_whitespace) {
-        Some(idx) => (&text[..idx], text[idx..].trim()),
-        None => (text, ""),
+    // 指令必须以 `/` 开头；无前缀的普通消息交给 AI 问答。
+    let Some(after_slash) = text.strip_prefix('/') else {
+        return Ok(Reply::Ask(text.to_string()));
+    };
+    // 指令 = 斜杠后首个空白分隔 token。
+    let (head, rest) = match after_slash.find(char::is_whitespace) {
+        Some(idx) => (&after_slash[..idx], after_slash[idx..].trim()),
+        None => (after_slash, ""),
     };
     let reply = match head {
         "帮助" | "help" | "?" | "？" => help_text(),
@@ -41,7 +49,7 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "时间" | "time" => format_time(clock),
         "随机" | "random" => random_reply(rest, random),
         "复读" | "echo" => echo_reply(rest),
-        _ => String::from("未识别指令。发送「帮助」查看可用指令"),
+        _ => String::from("未识别指令。发送「/帮助」查看可用指令"),
     };
     Ok(Reply::Text(reply))
 }
@@ -50,11 +58,12 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
 fn help_text() -> String {
     String::from(
         "可用指令：\n\
-         帮助 — 显示本列表\n\
-         时间 — 当前时间（UTC+8）\n\
-         随机 [n] — 1..=n 随机数（默认 100）\n\
-         复读 <文本> — 原样返回文本（≤140 字）\n\
-         关于 — 版本信息",
+         /帮助 — 显示本列表\n\
+         /时间 — 当前时间（UTC+8）\n\
+         /随机 [n] — 1..=n 随机数（默认 100）\n\
+         /复读 <文本> — 原样返回（≤140 字）\n\
+         /关于 — 版本信息\n\
+         直接发文字可向 AI 提问",
     )
 }
 
@@ -132,23 +141,23 @@ mod tests {
 
     #[test]
     fn help_commands_reply_with_listing() {
-        for input in ["帮助", "help", "?", "？", "  帮助  "] {
+        for input in ["/帮助", "/help", "/?", "/？", "  /帮助  "] {
             let Reply::Text(text) = dispatch(input, 0, 0).unwrap() else {
                 panic!("帮助 must reply: {input}");
             };
             assert!(text.contains("可用指令"), "listing missing: {text}");
-            assert!(text.contains("复读"), "command missing: {text}");
+            assert!(text.contains("/复读"), "command missing: {text}");
         }
     }
 
     #[test]
     fn time_reports_utc8_from_injected_clock() {
-        let Reply::Text(text) = dispatch("时间", SAMPLE_UNIX, 0).unwrap() else {
+        let Reply::Text(text) = dispatch("/时间", SAMPLE_UNIX, 0).unwrap() else {
             panic!("时间 must reply");
         };
         assert_eq!(text, "当前时间 2026-10-09 00:22:29 (UTC+8)");
         // 零点基准：unix 0 → 1970-01-01 08:00:00 (UTC+8)。
-        let Reply::Text(text) = dispatch("time", 0, 0).unwrap() else {
+        let Reply::Text(text) = dispatch("/time", 0, 0).unwrap() else {
             panic!("time must reply");
         };
         assert_eq!(text, "当前时间 1970-01-01 08:00:00 (UTC+8)");
@@ -157,22 +166,22 @@ mod tests {
     #[test]
     fn random_uses_injected_source_and_bounds() {
         // random=7, n=10 → 7 % 10 + 1 = 8。
-        let Reply::Text(text) = dispatch("随机 10", 0, 7).unwrap() else {
+        let Reply::Text(text) = dispatch("/随机 10", 0, 7).unwrap() else {
             panic!("随机 must reply");
         };
         assert_eq!(text, "随机数（1..=10）：8");
         // 缺省 n=100。
-        let Reply::Text(text) = dispatch("随机", 0, 7).unwrap() else {
+        let Reply::Text(text) = dispatch("/随机", 0, 7).unwrap() else {
             panic!("随机 must reply");
         };
         assert_eq!(text, "随机数（1..=100）：8");
         // 非整数参数 → 用法提示（显式回应）。
-        let Reply::Text(text) = dispatch("随机 abc", 0, 7).unwrap() else {
+        let Reply::Text(text) = dispatch("/随机 abc", 0, 7).unwrap() else {
             panic!("随机 abc must reply");
         };
         assert!(text.contains("用法"), "usage hint missing: {text}");
         // 越界参数收敛。
-        let Reply::Text(text) = dispatch("随机 0", 0, 7).unwrap() else {
+        let Reply::Text(text) = dispatch("/随机 0", 0, 7).unwrap() else {
             panic!("随机 0 must reply");
         };
         assert_eq!(text, "随机数（1..=1）：1");
@@ -180,18 +189,18 @@ mod tests {
 
     #[test]
     fn echo_returns_text_verbatim_and_truncates() {
-        let Reply::Text(text) = dispatch("复读 hello world", 0, 0).unwrap() else {
+        let Reply::Text(text) = dispatch("/复读 hello world", 0, 0).unwrap() else {
             panic!("复读 must reply");
         };
         assert_eq!(text, "hello world");
         // 缺参数 → 用法。
-        let Reply::Text(text) = dispatch("复读", 0, 0).unwrap() else {
+        let Reply::Text(text) = dispatch("/复读", 0, 0).unwrap() else {
             panic!("复读 must reply");
         };
         assert_eq!(text, "用法：复读 <文本>");
         // 超长截断到 140 字。
         let long = "字".repeat(200);
-        let input = format!("复读 {long}");
+        let input = format!("/复读 {long}");
         let Reply::Text(text) = dispatch(&input, 0, 0).unwrap() else {
             panic!("复读 must reply");
         };
@@ -200,14 +209,37 @@ mod tests {
 
     #[test]
     fn about_and_unknown_are_explicit_replies() {
-        let Reply::Text(text) = dispatch("关于", 0, 0).unwrap() else {
+        let Reply::Text(text) = dispatch("/关于", 0, 0).unwrap() else {
             panic!("关于 must reply");
         };
         assert!(text.contains("qq_bot_rust"), "version missing: {text}");
-        // 未知指令不装死：给出提示。
-        let Reply::Text(text) = dispatch("123", 0, 0).unwrap() else {
+        // 未知斜杠指令不装死：给出提示。
+        let Reply::Text(text) = dispatch("/123", 0, 0).unwrap() else {
             panic!("unknown command must not be silent");
         };
-        assert!(text.contains("帮助"), "hint missing: {text}");
+        assert!(text.contains("/帮助"), "hint missing: {text}");
+        // 裸斜杠（无指令名）同样提示。
+        let Reply::Text(text) = dispatch("/", 0, 0).unwrap() else {
+            panic!("bare slash must not be silent");
+        };
+        assert!(text.contains("/帮助"), "hint missing: {text}");
+    }
+
+    #[test]
+    fn plain_text_routes_to_ai_ask() {
+        // 无 `/` 前缀 → Ask，问题原样（trim 后）携带。
+        for input in [
+            "你好，这是什么群？",
+            "Rust 的所有权怎么理解",
+            "  今天天气  ",
+        ] {
+            let Reply::Ask(question) = dispatch(input, 0, 0).unwrap() else {
+                panic!("plain text must route to Ask: {input}");
+            };
+            assert_eq!(question, input.trim());
+        }
+        // 非指令的纯数字/英文同样进问答。
+        assert!(matches!(dispatch("123", 0, 0).unwrap(), Reply::Ask(_)));
+        assert!(matches!(dispatch("help", 0, 0).unwrap(), Reply::Ask(_)));
     }
 }

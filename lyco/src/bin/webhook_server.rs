@@ -7,6 +7,8 @@
 //!   （打印事件正文），失败回 403 并记录原因——不吞错、不 panic；
 //! - 消息类事件验签通过后，先回 200 再异步被动回复（AppAccessToken 缓存 +
 //!   OpenAPI 发送，协议层在 `qq_bot_rust::api`，指令层在 `qq_bot_rust::commands`）；
+//! - `/` 前缀 → 指令；其余正文 → AI 问答（spawn zerostack 单次问答，超时
+//!   kill、失败回显式兜底文案，绝不静默丢消息）；
 //! - 凭证只从环境变量 `QQ_BOT_SECRET` 读入 [`SecretString`]，永不进日志；
 //!   token 仅在构造 `Authorization` 头的 `expose()` 审计点取明文。
 //!
@@ -19,6 +21,10 @@
 //! | `WEBHOOK_BIND` | `0.0.0.0:8080` | 监听地址 |
 //! | `WEBHOOK_PRINT_EVENTS` | `1` | 是否打印已验签事件的原始报文 |
 //! | `WEBHOOK_REPLY` | `1` | 是否启用被动回复（`0` 关闭） |
+//! | `WEBHOOK_QA` | `1` | 是否启用 AI 问答（`0` 关闭；非 `/` 指令的普通消息） |
+//! | `ZEROSTACK_BIN` | `zerostack` | zerostack 可执行文件（空串等价于关闭问答） |
+//! | `QA_TIMEOUT_SECS` | `120` | 单次问答超时（5..=600 秒，超时回兜底文案） |
+//! | `QA_MAX_CHARS` | `1000` | 回答截断字数（50..=4000；平台无公开上限，保守截断） |
 
 use qq_bot_rust::api;
 use qq_bot_rust::callback::{self, OP_CHALLENGE, OP_EVENT};
@@ -64,6 +70,8 @@ struct Config {
     agent: ureq::Agent,
     /// AppAccessToken 缓存（互斥锁内仅做指针级存取，网络 I/O 不持锁）。
     token: Arc<Mutex<Option<CachedToken>>>,
+    /// AI 问答配置（zerostack 单次问答）。
+    qa: QaConfig,
 }
 
 /// 缓存的 AppAccessToken 及其绝对过期时刻（unix 秒）。
@@ -93,8 +101,16 @@ struct ReplyJob {
     msg_id: String,
     /// 事件类型（日志标签）。
     event_type: String,
-    /// 回复正文。
-    text: String,
+    /// 回复内容（指令文本，或待 AI 问答的问题）。
+    body: ReplyBody,
+}
+
+/// 回复内容形态。
+enum ReplyBody {
+    /// 直接发送的指令回复文本。
+    Text(String),
+    /// 需要先经 AI（zerostack 单次问答）求解的问题。
+    Ask(String),
 }
 
 impl ReplyJob {
@@ -102,6 +118,19 @@ impl ReplyJob {
     fn target_label(&self) -> &'static str {
         if self.is_group { "group" } else { "c2c" }
     }
+}
+
+#[derive(Clone)]
+/// AI 问答配置（`WEBHOOK_QA` / `ZEROSTACK_BIN` / `QA_TIMEOUT_SECS` / `QA_MAX_CHARS`）。
+struct QaConfig {
+    /// 是否启用问答（`WEBHOOK_QA=0` 关闭）。
+    enabled: bool,
+    /// zerostack 可执行文件（空串等价于关闭）。
+    bin: String,
+    /// 单次问答超时（超时杀进程，回复显式兜底文案）。
+    timeout: Duration,
+    /// 回答截断上限（字数；平台无公开上限，保守截断）。
+    max_chars: usize,
 }
 
 /// 出站失败分类（排障日志 + 401 有界重试判定）。
@@ -199,6 +228,25 @@ fn run() -> Result<(), String> {
     let reply_enabled = std::env::var("WEBHOOK_REPLY")
         .map(|value| value != "0")
         .unwrap_or(true);
+    // AI 问答：默认开启；`WEBHOOK_QA=0` 或空 `ZEROSTACK_BIN` 关闭。
+    let qa_enabled = std::env::var("WEBHOOK_QA")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    let qa_bin = std::env::var("ZEROSTACK_BIN").unwrap_or_else(|_| "zerostack".to_string());
+    let qa_timeout_secs = std::env::var("QA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120);
+    let qa_max_chars = std::env::var("QA_MAX_CHARS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000);
+    let qa = QaConfig {
+        enabled: qa_enabled && !qa_bin.is_empty(),
+        bin: qa_bin,
+        timeout: Duration::from_secs(qa_timeout_secs.clamp(5, 600)),
+        max_chars: qa_max_chars.clamp(50, 4_000),
+    };
     let config = Config {
         secret: SecretString::new(secret_value),
         print_events: std::env::var("WEBHOOK_PRINT_EVENTS")
@@ -212,6 +260,7 @@ fn run() -> Result<(), String> {
             .timeout_write(IO_TIMEOUT)
             .build(),
         token: Arc::new(Mutex::new(None)),
+        qa,
     };
     let bind = std::env::var("WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
@@ -233,11 +282,12 @@ fn run() -> Result<(), String> {
     logln(
         "INFO",
         &format!(
-            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={}",
+            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={} qa={}",
             config.app_id.as_deref().unwrap_or("-"),
             hex_encode(&pubkey),
             config.print_events,
             config.can_reply(),
+            if config.qa.enabled { "on" } else { "off" },
         ),
     );
 
@@ -509,7 +559,8 @@ fn handle_webhook(config: &Config, request: &HttpRequest) -> Reply {
 ///
 /// - 无 `t` / 非消息类事件 → `Ok(None)`（正常分流，不是错误）；
 /// - 消息事件但结构非法 → `Err`（上抛，由工作线程记 WARN，不吞）；
-/// - 正文为空或指令返回 [`Reply::Skip`] → `Ok(None)`（无可回内容）。
+/// - 正文为空或指令返回 [`Reply::Skip`] → `Ok(None)`（无可回内容）；
+/// - [`Reply::Ask`] → 携带问题，由工作线程跑 AI 问答后发送。
 fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob>, LibError> {
     let Some(event_type) = event::event_type(body)? else {
         return Ok(None);
@@ -524,8 +575,9 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         // parse_message_event 已保证至少一个目标；此处保持严格，不 unwrap。
         (None, None) => return Err(LibError::NoReplyTarget),
     };
-    let text = match commands::dispatch(&parsed.content, now_unix, random)? {
-        CommandReply::Text(text) => text,
+    let reply_body = match commands::dispatch(&parsed.content, now_unix, random)? {
+        CommandReply::Text(text) => ReplyBody::Text(text),
+        CommandReply::Ask(question) => ReplyBody::Ask(question),
         CommandReply::Skip => return Ok(None),
     };
     Ok(Some(ReplyJob {
@@ -533,7 +585,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         openid,
         msg_id: parsed.msg_id,
         event_type: parsed.event_type,
-        text,
+        body: reply_body,
     }))
 }
 
@@ -547,7 +599,7 @@ fn spawn_reply(config: Config, body: Vec<u8>) {
     }
 }
 
-/// 回复工作线程：规划 → 发送（仅 401 强刷重试一次）→ 记录结果。
+/// 回复工作线程：规划 → 解析正文（Ask 则跑 AI 问答）→ 发送（仅 401 强刷重试一次）→ 记录结果。
 fn reply_worker(config: Config, body: Vec<u8>) {
     let job = match plan_reply(&body, unix_now(), mix_random()) {
         Ok(Some(job)) => job,
@@ -557,7 +609,14 @@ fn reply_worker(config: Config, body: Vec<u8>) {
             return;
         }
     };
-    let outcome = match send_reply(&config, &job, false) {
+    let label = sanitize_text(job.event_type.as_bytes(), 48);
+    // Ask：先跑 zerostack 单次问答得到回答正文（有界超时；失败回显式兜底文案，
+    // 不吞错——错误已记日志）。Text：直接用指令回复。
+    let text = match &job.body {
+        ReplyBody::Text(text) => text.clone(),
+        ReplyBody::Ask(question) => answer_question(&config, &label, question),
+    };
+    let outcome = match send_reply(&config, &job, &text, false) {
         Ok(reply_id) => Ok(reply_id),
         // 401 = 凭证失效/过期：强刷 token 后有界重试一次（绝不循环）。
         Err(err @ SendError::Api(LibError::Api(401))) => {
@@ -565,11 +624,10 @@ fn reply_worker(config: Config, body: Vec<u8>) {
                 "INFO",
                 &format!("reply got 401, refreshing token and retrying once: {err}"),
             );
-            send_reply(&config, &job, true)
+            send_reply(&config, &job, &text, true)
         }
         Err(err) => Err(err),
     };
-    let label = sanitize_text(job.event_type.as_bytes(), 48);
     match outcome {
         Ok(reply_id) => logln(
             "INFO",
@@ -577,7 +635,7 @@ fn reply_worker(config: Config, body: Vec<u8>) {
                 "reply sent event={label} target={} reply_id={} text_bytes={}",
                 job.target_label(),
                 sanitize_text(reply_id.as_bytes(), 64),
-                job.text.len(),
+                text.len(),
             ),
         ),
         Err(err) => logln(
@@ -591,11 +649,174 @@ fn reply_worker(config: Config, body: Vec<u8>) {
 }
 
 /// 发送一次回复：取 token → 构造请求 → POST → 解析回执。
-fn send_reply(config: &Config, job: &ReplyJob, force_refresh: bool) -> Result<String, SendError> {
+fn send_reply(
+    config: &Config,
+    job: &ReplyJob,
+    text: &str,
+    force_refresh: bool,
+) -> Result<String, SendError> {
     let token = ensure_token(config, force_refresh)?;
-    let request = api::send_message_request(job.is_group, &job.openid, &job.text, &job.msg_id, 1)?;
+    let request = api::send_message_request(job.is_group, &job.openid, text, &job.msg_id, 1)?;
     let (status, body) = post_json(&config.agent, &request, Some(&token))?;
     Ok(api::parse_send_response(status, &body)?.id)
+}
+
+/// AI 问答：调用 zerostack 单次问答，返回可发送的回答正文。
+///
+/// 失败（未启用/启动失败/超时/非零退出/空回答）→ 记 WARN 并返回显式兜底
+/// 文案：错误不吞（日志留痕），机器人不装死（用户得到明确回应）。
+fn answer_question(config: &Config, label: &str, question: &str) -> String {
+    let started = std::time::Instant::now();
+    match ask_zerostack(config, question) {
+        Ok(answer) => {
+            logln(
+                "INFO",
+                &format!(
+                    "qa answered event={label} q_bytes={} a_chars={} ms={}",
+                    question.len(),
+                    answer.chars().count(),
+                    started.elapsed().as_millis(),
+                ),
+            );
+            answer
+        }
+        Err(err) => {
+            logln(
+                "WARN",
+                &format!("qa failed event={label} q_bytes={}: {err}", question.len()),
+            );
+            String::from("AI 问答暂时不可用，请稍后再试")
+        }
+    }
+}
+
+/// 执行 zerostack 单次问答（`-p` 打印回答到 stdout；`--no-tools` 单轮纯问答）。
+///
+/// - 问答未启用 → Err（由 [`answer_question`] 转为提示文案）；
+/// - 超时 → kill 子进程后 Err（绝不无限等待占住工作线程）；
+/// - stdout/stderr 由独立线程排空（避免管道写满死锁），退出后回收；
+/// - 回答经控制字符清洗 + 字数截断（平台未公开文本长度上限，保守截断）。
+fn ask_zerostack(config: &Config, question: &str) -> Result<String, String> {
+    if !config.qa.enabled {
+        return Err("qa disabled".to_string());
+    }
+    let args = [
+        "--no-tools".to_string(),
+        "--no-context-files".to_string(),
+        // 临时模式：不落会话文件（问答为一次性调用，避免数据目录无限增长）。
+        "--no-session".to_string(),
+        "--no-color".to_string(),
+        "-p".to_string(),
+        question.to_string(),
+    ];
+    let raw = run_capture(&config.qa.bin, &args, config.qa.timeout)?;
+    let answer = clean_answer(&raw);
+    if answer.is_empty() {
+        return Err("empty answer on stdout".to_string());
+    }
+    Ok(truncate_answer(&answer, config.qa.max_chars))
+}
+
+/// 启动子进程并在超时内收集 stdout；非零退出/超时/启动失败 → Err。
+///
+/// stdout/stderr 由读取线程排空；超时 kill 后同样回收线程，不留孤儿。
+fn run_capture(bin: &str, args: &[String], timeout: Duration) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn {bin}: {err}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout pipe missing".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr pipe missing".to_string())?;
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status: std::process::ExitStatus = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(format!("timeout after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(format!("wait: {err}"));
+            }
+        }
+    };
+    let out = out_reader
+        .join()
+        .map_err(|_| "stdout reader panicked".to_string())?;
+    let err_bytes = err_reader
+        .join()
+        .map_err(|_| "stderr reader panicked".to_string())?;
+    if !status.success() {
+        return Err(format!("exit {status}: {}", sanitize_text(&err_bytes, 300)));
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// 清洗回答：剥离 ANSI 转义序列与控制字符（保留换行）并 trim。
+fn clean_answer(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    // 状态机：0 正文 / 1 ESC 之后 / 2 CSI|OSC 序列中。
+    let mut state = 0u8;
+    for c in raw.chars() {
+        match state {
+            1 => state = if c == '[' || c == ']' { 2 } else { 0 },
+            // 序列被换行打断（防跑飞）：结束序列并保留换行。
+            2 if c == '\n' => {
+                state = 0;
+                out.push('\n');
+            }
+            // CSI 最终字节（0x40..=0x7E）→ 序列结束。
+            2 if ('\u{40}'..='\u{7e}').contains(&c) => state = 0,
+            // 参数/中间字节：丢弃。
+            2 => {}
+            _ => {
+                if c == '\u{1b}' {
+                    state = 1;
+                } else if c == '\n' || !c.is_control() {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 按字数截断（char 边界安全；超长加省略号）。
+fn truncate_answer(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 /// 取可用 AppAccessToken：命中缓存直接返回，否则向平台换取并写回。
@@ -795,6 +1016,13 @@ mod tests {
             reply_enabled: true,
             agent: ureq::AgentBuilder::new().build(),
             token: Arc::new(Mutex::new(None)),
+            // 问答默认关闭：单测不 spawn 进程。
+            qa: super::QaConfig {
+                enabled: false,
+                bin: String::new(),
+                timeout: std::time::Duration::from_secs(1),
+                max_chars: 100,
+            },
         }
     }
 
@@ -935,27 +1163,35 @@ mod tests {
         assert!(response.contains(&expected), "resp={response}");
     }
 
-    /// 真实单聊事件报文（Radxa 抓取；中文按 UTF-8 字节转义）。
-    const C2C_HELP_EVENT: &[u8] = b"{\"op\":0,\"id\":\"C2C_MESSAGE_CREATE:sfyoo42bh\",\"d\":{\"id\":\"ROBOT1.0_oC3JDEal\",\"content\":\"\xe5\xb8\xae\xe5\x8a\xa9\",\"timestamp\":\"2026-10-09T00:22:29+08:00\",\"author\":{\"id\":\"DE8C8AEC\",\"username\":\"\",\"bot\":false,\"user_openid\":\"DE8C8AECAF13F8D144240291E8D7B0A7\",\"union_openid\":\"\"},\"message_type\":0},\"t\":\"C2C_MESSAGE_CREATE\",\"seq\":1}";
+    /// 真实单聊事件报文（Radxa 抓取；中文按 UTF-8 字节转义，`/帮助` 带指令前缀）。
+    const C2C_HELP_EVENT: &[u8] = b"{\"op\":0,\"id\":\"C2C_MESSAGE_CREATE:sfyoo42bh\",\"d\":{\"id\":\"ROBOT1.0_oC3JDEal\",\"content\":\"/\xe5\xb8\xae\xe5\x8a\xa9\",\"timestamp\":\"2026-10-09T00:22:29+08:00\",\"author\":{\"id\":\"DE8C8AEC\",\"username\":\"\",\"bot\":false,\"user_openid\":\"DE8C8AECAF13F8D144240291E8D7B0A7\",\"union_openid\":\"\"},\"message_type\":0},\"t\":\"C2C_MESSAGE_CREATE\",\"seq\":1}";
 
     /// 真实群事件报文（成员进群；无正文、无消息 id → 不属于消息事件）。
     const GROUP_MEMBER_ADD: &[u8] = b"{\"op\":0,\"id\":\"GROUP_MEMBER_ADD:x\",\"d\":{\"timestamp\":\"2026-10-09T00:19:16+08:00\",\"group_openid\":\"3D54AA8E\",\"member_openid\":\"095AF6EF\"},\"t\":\"GROUP_MEMBER_ADD\",\"seq\":3}";
+
+    /// 取指令回复文本（非 Text 断言失败）。
+    fn text_of(job: &super::ReplyJob) -> &str {
+        match &job.body {
+            super::ReplyBody::Text(text) => text,
+            super::ReplyBody::Ask(question) => panic!("expected Text, got Ask({question})"),
+        }
+    }
 
     #[test]
     fn plan_reply_targets_c2c_for_help_command() {
         let job = plan_reply(C2C_HELP_EVENT, 1_791_476_549, 0)
             .unwrap()
-            .expect("帮助 must plan a reply");
+            .expect("/帮助 must plan a reply");
         assert!(!job.is_group);
         assert_eq!(job.openid, "DE8C8AECAF13F8D144240291E8D7B0A7");
         assert_eq!(job.msg_id, "ROBOT1.0_oC3JDEal");
         assert_eq!(job.event_type, "C2C_MESSAGE_CREATE");
-        assert!(job.text.contains("可用指令"), "text={}", job.text);
+        assert!(text_of(&job).contains("可用指令"), "text={}", text_of(&job));
     }
 
     #[test]
     fn plan_reply_targets_group_and_answers_unknown_command() {
-        let body = b"{\"op\":0,\"id\":\"GROUP_AT_MESSAGE_CREATE:g\",\"d\":{\"author\":{\"id\":\"79BE\",\"user_openid\":\"79BE66EF\"},\"content\":\"123\",\"group_openid\":\"3D54AA8E\",\"id\":\"ROBOT1.0_grp\",\"message_type\":0},\"t\":\"GROUP_AT_MESSAGE_CREATE\",\"seq\":1}";
+        let body = b"{\"op\":0,\"id\":\"GROUP_AT_MESSAGE_CREATE:g\",\"d\":{\"author\":{\"id\":\"79BE\",\"user_openid\":\"79BE66EF\"},\"content\":\"/123\",\"group_openid\":\"3D54AA8E\",\"id\":\"ROBOT1.0_grp\",\"message_type\":0},\"t\":\"GROUP_AT_MESSAGE_CREATE\",\"seq\":1}";
         let job = plan_reply(body, 0, 0)
             .unwrap()
             .expect("group @ message must plan a reply");
@@ -963,7 +1199,21 @@ mod tests {
         assert_eq!(job.openid, "3D54AA8E");
         assert_eq!(job.msg_id, "ROBOT1.0_grp");
         // 未知指令不装死。
-        assert!(job.text.contains("帮助"), "text={}", job.text);
+        assert!(text_of(&job).contains("帮助"), "text={}", text_of(&job));
+    }
+
+    #[test]
+    fn plan_reply_routes_plain_text_to_ai_ask() {
+        // 无 `/` 前缀的群消息 → Ask，问题原样携带、目标仍为群。
+        let body = b"{\"op\":0,\"id\":\"GROUP_AT_MESSAGE_CREATE:g\",\"d\":{\"author\":{\"id\":\"79BE\",\"user_openid\":\"79BE66EF\"},\"content\":\"Rust is fun\",\"group_openid\":\"3D54AA8E\",\"id\":\"ROBOT1.0_grp\",\"message_type\":0},\"t\":\"GROUP_AT_MESSAGE_CREATE\",\"seq\":1}";
+        let job = plan_reply(body, 0, 0)
+            .unwrap()
+            .expect("plain text must plan an ask");
+        assert!(job.is_group);
+        let super::ReplyBody::Ask(question) = &job.body else {
+            panic!("expected Ask, got Text");
+        };
+        assert_eq!(question, "Rust is fun");
     }
 
     #[test]
@@ -989,6 +1239,36 @@ mod tests {
         // 无回复目标。
         let body = b"{\"d\":{\"id\":\"m\",\"content\":\"hi\"},\"t\":\"C2C_MESSAGE_CREATE\"}";
         assert_eq!(plan_reply(body, 0, 0).err(), Some(LibError::NoReplyTarget));
+    }
+
+    #[test]
+    fn clean_answer_strips_controls_and_trims() {
+        // 控制字符（含 ANSI ESC）被移除，换行保留。
+        assert_eq!(
+            super::clean_answer("\u{1b}[31m红色\u{1b}[0m\n第二行\n"),
+            "红色\n第二行"
+        );
+        // 全控制字符 + 空白 → 空串（调用方按空回答处理）。
+        assert_eq!(super::clean_answer(" \n\t "), "");
+    }
+
+    #[test]
+    fn truncate_answer_caps_by_chars_with_ellipsis() {
+        assert_eq!(super::truncate_answer("短回答", 100), "短回答");
+        let long = "问".repeat(50);
+        let out = super::truncate_answer(&long, 10);
+        assert_eq!(out.chars().count(), 11, "10 字 + 省略号");
+        assert!(out.ends_with('…'));
+        // 中英混排按 char 截断，不 panic（char 边界安全）。
+        assert!(super::truncate_answer("abc中文def", 4).ends_with('…'));
+    }
+
+    #[test]
+    fn answer_question_disabled_returns_fallback() {
+        // 问答未启用（单测配置）→ 显式兜底文案，不 spawn 进程。
+        let text = super::answer_question(&config(), "TEST", "任意问题");
+        assert!(text.contains("AI 问答"), "text={text}");
+        assert!(super::ask_zerostack(&config(), "q").is_err());
     }
 
     #[test]
