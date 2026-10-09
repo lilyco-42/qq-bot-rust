@@ -35,6 +35,11 @@ QQ 机器人 OpenAPI SDK —— `no_std + alloc` 核心，wtx 生态传输层，
   双线程排空 stdout/stderr、50ms 轮询到超时 kill、ANSI/控制字符清洗、
   按字数截断（平台无公开上限，保守可配）；未启用/失败回显式兜底文案不装死；
   `cargo test` 61 项全绿）
+- [x] 服务器状态查询 `/对局`（别名 `/状态`、`/服务器`）：只读公开 HTTP 接口，不改动
+  游戏/大厅服务器——游戏 `/healthz` 给在线人数/对局数/房间数（出现 `matching`/`queued`
+  字段时补报快速匹配队列，前向兼容 0.2.3），大厅 `/api/online_count` + `/api/active_rooms`
+  给在线人数/房间数；三个请求相互独立，任一失败只少一行、全失败回显式兜底；
+  地址经 `SP_STATUS_URL` / `LOBBY_BASE_URL` 可指向自建服；`cargo test` 66 项全绿）
 - [ ] WebSocket 兼容链路（官方已宣布下线，仅作过渡）
 
 ## Radxa 部署（aarch64，验收现场）
@@ -48,6 +53,7 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 #   export NIM_API_KEY=...          # AI 问答免费模型 key（同上，不进仓库/日志）
 #   export ZEROSTACK_BIN=~/qq_bot/zerostack_wrap.sh
 # 可选：WEBHOOK_QA=0 关问答；QA_TIMEOUT_SECS（默认120，5..=600）；QA_MAX_CHARS（默认1000，50..=4000）
+# 可选：WEBHOOK_STATUS=0 关 /对局 状态查询；SP_STATUS_URL / LOBBY_BASE_URL 换自建服地址
 # AI 问答（zerostack v1.8.4，aarch64-musl 静态单二进制 → ~/.local/bin/）：
 #   ~/.config/zerostack/config.toml            # provider=nim（NIM 免费 deepseek 闪光模型）
 #   ~/.local/share/zerostack/prompts/qqbot.md  # 回答风格 prompt（首行 %%mode=readonly）

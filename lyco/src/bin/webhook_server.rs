@@ -25,6 +25,9 @@
 //! | `ZEROSTACK_BIN` | `zerostack` | zerostack 可执行文件（空串等价于关闭问答） |
 //! | `QA_TIMEOUT_SECS` | `120` | 单次问答超时（5..=600 秒，超时回兜底文案） |
 //! | `QA_MAX_CHARS` | `1000` | 回答截断字数（50..=4000；平台无公开上限，保守截断） |
+//! | `WEBHOOK_STATUS` | `1` | 是否启用 `/对局` 服务器状态查询（`0` 关闭） |
+//! | `SP_STATUS_URL` | `https://sp.lain42.top/healthz` | 游戏服务器状态地址 |
+//! | `LOBBY_BASE_URL` | `https://sp.lain42.top/lobby` | 组队大厅基地址（读其公开计数） |
 
 use qq_bot_rust::api;
 use qq_bot_rust::callback::{self, OP_CHALLENGE, OP_EVENT};
@@ -72,6 +75,8 @@ struct Config {
     token: Arc<Mutex<Option<CachedToken>>>,
     /// AI 问答配置（zerostack 单次问答）。
     qa: QaConfig,
+    /// 服务器状态查询配置（`/对局`）。
+    status: StatusConfig,
 }
 
 /// 缓存的 AppAccessToken 及其绝对过期时刻（unix 秒）。
@@ -111,6 +116,8 @@ enum ReplyBody {
     Text(String),
     /// 需要先经 AI（zerostack 单次问答）求解的问题。
     Ask(String),
+    /// 需要查询服务器状态（`/对局`），由接收端发 HTTP 请求后成文。
+    ServerStatus,
 }
 
 impl ReplyJob {
@@ -131,6 +138,21 @@ struct QaConfig {
     timeout: Duration,
     /// 回答截断上限（字数；平台无公开上限，保守截断）。
     max_chars: usize,
+}
+
+/// 服务器状态查询配置（`/对局`：`WEBHOOK_STATUS` / `SP_STATUS_URL` / `LOBBY_BASE_URL`）。
+///
+/// 只读公开 HTTP 接口，不改动游戏/大厅服务器：游戏 `/healthz` 给聚合
+/// 对局/人数（0.2.3 起可能含 `matching`/`queued` 快速匹配队列），大厅
+/// `/api/online_count`、`/api/active_rooms` 给在线人数与房间数。
+#[derive(Clone)]
+struct StatusConfig {
+    /// 是否启用状态查询（`WEBHOOK_STATUS=0` 关闭）。
+    enabled: bool,
+    /// 游戏服务器 `/healthz` 地址。
+    game_url: String,
+    /// 组队大厅基地址（其 `/api/*` 与网页入口）。
+    lobby_base: String,
 }
 
 /// 出站失败分类（排障日志 + 401 有界重试判定）。
@@ -247,6 +269,16 @@ fn run() -> Result<(), String> {
         timeout: Duration::from_secs(qa_timeout_secs.clamp(5, 600)),
         max_chars: qa_max_chars.clamp(50, 4_000),
     };
+    // 服务器状态查询：默认开启；`WEBHOOK_STATUS=0` 关闭。地址可换成自建服。
+    let status = StatusConfig {
+        enabled: std::env::var("WEBHOOK_STATUS")
+            .map(|value| value != "0")
+            .unwrap_or(true),
+        game_url: std::env::var("SP_STATUS_URL")
+            .unwrap_or_else(|_| "https://sp.lain42.top/healthz".to_string()),
+        lobby_base: std::env::var("LOBBY_BASE_URL")
+            .unwrap_or_else(|_| "https://sp.lain42.top/lobby".to_string()),
+    };
     let config = Config {
         secret: SecretString::new(secret_value),
         print_events: std::env::var("WEBHOOK_PRINT_EVENTS")
@@ -261,6 +293,7 @@ fn run() -> Result<(), String> {
             .build(),
         token: Arc::new(Mutex::new(None)),
         qa,
+        status,
     };
     let bind = std::env::var("WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
@@ -578,6 +611,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
     let reply_body = match commands::dispatch(&parsed.content, now_unix, random)? {
         CommandReply::Text(text) => ReplyBody::Text(text),
         CommandReply::Ask(question) => ReplyBody::Ask(question),
+        CommandReply::ServerStatus => ReplyBody::ServerStatus,
         CommandReply::Skip => return Ok(None),
     };
     Ok(Some(ReplyJob {
@@ -615,6 +649,7 @@ fn reply_worker(config: Config, body: Vec<u8>) {
     let text = match &job.body {
         ReplyBody::Text(text) => text.clone(),
         ReplyBody::Ask(question) => answer_question(&config, &label, question),
+        ReplyBody::ServerStatus => server_status(&config, &label),
     };
     let outcome = match send_reply(&config, &job, &text, false) {
         Ok(reply_id) => Ok(reply_id),
@@ -688,6 +723,140 @@ fn answer_question(config: &Config, label: &str, question: &str) -> String {
             String::from("AI 问答暂时不可用，请稍后再试")
         }
     }
+}
+
+/// 服务器状态：只读查询游戏 `/healthz` 与大厅公开计数，成文返回。
+///
+/// 三个请求相互独立：任一失败只少一行，绝不让整条回复变成错误；全失败
+/// 才回显式兜底文案。失败原因逐条记 WARN（不吞错）。
+fn server_status(config: &Config, label: &str) -> String {
+    if !config.status.enabled {
+        return String::from("服务器状态查询未启用（/帮助 查看指令）");
+    }
+    let started = std::time::Instant::now();
+    let game = http_get_text(&config.agent, &config.status.game_url);
+    let base = config.status.lobby_base.trim_end_matches('/');
+    let online = http_get_text(&config.agent, &format!("{base}/api/online_count"));
+    let active = http_get_text(&config.agent, &format!("{base}/api/active_rooms"));
+    if let Err(err) = &game {
+        logln("WARN", &format!("status game fetch failed: {err}"));
+    }
+    if let Err(err) = &online {
+        logln("WARN", &format!("status lobby online fetch failed: {err}"));
+    }
+    if let Err(err) = &active {
+        logln("WARN", &format!("status lobby rooms fetch failed: {err}"));
+    }
+    let text = compose_status(
+        game.as_deref().ok(),
+        online.as_deref().ok(),
+        active.as_deref().ok(),
+        base,
+    );
+    logln(
+        "INFO",
+        &format!(
+            "status queried event={label} game={} lobby_online={} lobby_rooms={} ms={}",
+            if game.is_ok() { "ok" } else { "err" },
+            online.is_ok(),
+            active.is_ok(),
+            started.elapsed().as_millis(),
+        ),
+    );
+    text
+}
+
+/// GET 一个文本响应；非 2xx 也取回 body 供排障（不丢信息）。
+fn http_get_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    match agent.get(url).call() {
+        Ok(response) => response
+            .into_string()
+            .map_err(|err| format!("read body: {err}")),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            Err(format!(
+                "status {status}: {}",
+                sanitize_text(body.as_bytes(), 120)
+            ))
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// 纯函数：把三份可选的应答正文拼成回复文本（无 IO，便于单测）。
+fn compose_status(
+    game: Option<&str>,
+    online: Option<&str>,
+    active: Option<&str>,
+    link: &str,
+) -> String {
+    let mut lines: Vec<String> = vec![String::from("🎮 卫戍协议 · 服务器状态")];
+    let mut any = false;
+    if let Some(body) = game {
+        let humans = json_int(body, "humans");
+        let matches = json_int(body, "matches");
+        let rooms = json_int(body, "rooms");
+        if humans.is_some() || matches.is_some() || rooms.is_some() {
+            lines.push(format!(
+                "游戏服：{} 人在线 · {} 场对局 · {} 房间 · 观战 {}",
+                humans.unwrap_or(0),
+                matches.unwrap_or(0),
+                rooms.unwrap_or(0),
+                json_int(body, "spectators").unwrap_or(0),
+            ));
+            // 快速匹配队列（0.2.3 起 /healthz 可能带这两个字段）。
+            if let Some(matching) = json_int(body, "matching") {
+                lines.push(format!(
+                    "快速匹配：{} 队 / {} 人等待",
+                    matching,
+                    json_int(body, "queued").unwrap_or(0),
+                ));
+            }
+            any = true;
+        }
+    }
+    if let Some(count) = online.and_then(|body| json_int(body, "online_count")) {
+        match active.and_then(|body| json_int(body, "active_room_count")) {
+            Some(rooms) => lines.push(format!("组队大厅：{count} 人在线 · {rooms} 个房间")),
+            None => lines.push(format!("组队大厅：{count} 人在线")),
+        }
+        any = true;
+    }
+    if !any {
+        return String::from("服务器状态暂时不可用，请稍后再试");
+    }
+    if !link.is_empty() {
+        lines.push(format!("一起玩：{link}"));
+    }
+    lines.join("\n")
+}
+
+/// 从扁平 JSON 文本里读一个整数字段（键后必须跟 `:`；无 serde 依赖）。
+///
+/// 只服务本用例的 `/healthz`、`/api/online_count` 等扁平对象：找 `"key"`，
+/// 跳过冒号与空白后取连续数字。找不到/非整数 → `None`。
+fn json_int(body: &str, key: &str) -> Option<i64> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(offset) = body[from..].find(&needle) {
+        let after = from + offset + needle.len();
+        let rest = body[after..].trim_start();
+        if let Some(rest) = rest.strip_prefix(':') {
+            let digits: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            if !digits.is_empty()
+                && digits != "-"
+                && let Ok(value) = digits.parse::<i64>()
+            {
+                return Some(value);
+            }
+        }
+        from = after;
+    }
+    None
 }
 
 /// 执行 zerostack 单次问答（`-p` 打印回答到 stdout；`--no-tools` 单轮纯问答）。
@@ -1023,6 +1192,12 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 max_chars: 100,
             },
+            // 状态查询默认关闭：单测不发网络请求。
+            status: super::StatusConfig {
+                enabled: false,
+                game_url: "http://127.0.0.1:1/healthz".to_string(),
+                lobby_base: "http://127.0.0.1:1/lobby".to_string(),
+            },
         }
     }
 
@@ -1174,6 +1349,7 @@ mod tests {
         match &job.body {
             super::ReplyBody::Text(text) => text,
             super::ReplyBody::Ask(question) => panic!("expected Text, got Ask({question})"),
+            super::ReplyBody::ServerStatus => panic!("expected Text, got ServerStatus"),
         }
     }
 
@@ -1214,6 +1390,16 @@ mod tests {
             panic!("expected Ask, got Text");
         };
         assert_eq!(question, "Rust is fun");
+    }
+
+    #[test]
+    fn plan_reply_routes_status_command() {
+        // `/对局`（UTF-8）→ ServerStatus，目标仍为单聊。
+        let body = b"{\"op\":0,\"id\":\"C2C_MESSAGE_CREATE:g\",\"d\":{\"author\":{\"id\":\"79BE\",\"user_openid\":\"79BE66EF\"},\"content\":\"/\xe5\xaf\xb9\xe5\xb1\x80\",\"id\":\"ROBOT1.0_grp\",\"message_type\":0},\"t\":\"C2C_MESSAGE_CREATE\",\"seq\":1}";
+        let job = plan_reply(body, 0, 0)
+            .unwrap()
+            .expect("/对局 must plan a reply");
+        assert!(matches!(job.body, super::ReplyBody::ServerStatus));
     }
 
     #[test]
@@ -1261,6 +1447,61 @@ mod tests {
         assert!(out.ends_with('…'));
         // 中英混排按 char 截断，不 panic（char 边界安全）。
         assert!(super::truncate_answer("abc中文def", 4).ends_with('…'));
+    }
+
+    #[test]
+    fn json_int_reads_flat_fields() {
+        let body = r#"{"ok":true,"version":1,"rooms":98,"matches":96,"humans":108,"bots":25,"spectators":0}"#;
+        assert_eq!(super::json_int(body, "humans"), Some(108));
+        assert_eq!(super::json_int(body, "matches"), Some(96));
+        assert_eq!(super::json_int(body, "rooms"), Some(98));
+        // 字段不存在 → None（键必须后跟冒号）。
+        assert_eq!(super::json_int(body, "matching"), None);
+        assert_eq!(super::json_int(body, "spectators"), Some(0));
+        // 快速匹配字段（0.2.3 起可能出现在 /healthz）。
+        assert_eq!(
+            super::json_int(r#"{"matching":2,"queued":5}"#, "queued"),
+            Some(5)
+        );
+        // 值里出现同名键不误读。
+        assert_eq!(
+            super::json_int(r#"{"a":"humans:9","humans":3}"#, "humans"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn compose_status_formats_game_and_lobby() {
+        let game = r#"{"humans":108,"matches":96,"rooms":98,"spectators":0}"#;
+        let online = r#"{"online_count":0}"#;
+        let active = r#"{"active_room_count":1}"#;
+        let text = super::compose_status(
+            Some(game),
+            Some(online),
+            Some(active),
+            "https://sp.lain42.top/lobby",
+        );
+        assert!(text.contains("108 人在线"), "text={text}");
+        assert!(text.contains("96 场对局"), "text={text}");
+        assert!(text.contains("组队大厅"), "text={text}");
+        assert!(text.contains("https://sp.lain42.top/lobby"), "text={text}");
+        // 队列字段存在时多一行。
+        let queued = r#"{"humans":3,"matches":1,"rooms":2,"spectators":0,"matching":1,"queued":2}"#;
+        let text = super::compose_status(Some(queued), None, None, "L");
+        assert!(text.contains("快速匹配"), "text={text}");
+        assert!(text.contains("2 人等待"), "text={text}");
+        // 三份全失败 → 显式兜底，不是空串。
+        assert!(
+            super::compose_status(None, None, None, "L").contains("暂时不可用"),
+            "must fall back"
+        );
+    }
+
+    #[test]
+    fn server_status_disabled_returns_hint_without_network() {
+        // 单测配置 status.enabled=false → 不触网，直接给提示。
+        let text = super::server_status(&config(), "TEST");
+        assert!(text.contains("未启用"), "text={text}");
     }
 
     #[test]

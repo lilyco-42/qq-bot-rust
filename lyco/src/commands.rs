@@ -18,6 +18,11 @@ pub enum Reply {
     Text(String),
     /// 需要 AI 问答的正文（非 `/` 指令的普通消息，问题原样携带）。
     Ask(String),
+    /// 需要查询服务器状态（对局/等待），由调用方发起网络请求。
+    ///
+    /// 分发层保持纯函数（无 IO）：只声明意图，实际请求在接收端完成，
+    /// 与 [`Reply::Ask`] 同一模式。
+    ServerStatus,
     /// 不需要回复（如空内容、无法构成回复的输入）。
     Skip,
 }
@@ -44,14 +49,16 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         None => (after_slash, ""),
     };
     let reply = match head {
-        "帮助" | "help" | "?" | "？" => help_text(),
-        "关于" | "about" => about_text(),
-        "时间" | "time" => format_time(clock),
-        "随机" | "random" => random_reply(rest, random),
-        "复读" | "echo" => echo_reply(rest),
-        _ => String::from("未识别指令。发送「/帮助」查看可用指令"),
+        "帮助" | "help" | "?" | "？" => Reply::Text(help_text()),
+        "关于" | "about" => Reply::Text(about_text()),
+        "时间" | "time" => Reply::Text(format_time(clock)),
+        "随机" | "random" => Reply::Text(random_reply(rest, random)),
+        "复读" | "echo" => Reply::Text(echo_reply(rest)),
+        // 服务器对局/等待状态：声明意图，网络请求在接收端完成。
+        "对局" | "状态" | "服务器" | "status" | "server" => Reply::ServerStatus,
+        _ => Reply::Text(String::from("未识别指令。发送「/帮助」查看可用指令")),
     };
-    Ok(Reply::Text(reply))
+    Ok(reply)
 }
 
 /// 帮助文案。
@@ -62,6 +69,7 @@ fn help_text() -> String {
          /时间 — 当前时间（UTC+8）\n\
          /随机 [n] — 1..=n 随机数（默认 100）\n\
          /复读 <文本> — 原样返回（≤140 字）\n\
+         /对局 — 服务器对局/等待状态\n\
          /关于 — 版本信息\n\
          直接发文字可向 AI 提问",
     )
@@ -223,6 +231,30 @@ mod tests {
             panic!("bare slash must not be silent");
         };
         assert!(text.contains("/帮助"), "hint missing: {text}");
+    }
+
+    #[test]
+    fn status_command_declares_server_query() {
+        // `/对局` 及其别名 → ServerStatus（由接收端发起网络请求）。
+        for input in [
+            "/对局",
+            "/状态",
+            "/服务器",
+            "/status",
+            "/server",
+            "  /对局  ",
+        ] {
+            assert_eq!(
+                dispatch(input, 0, 0).unwrap(),
+                Reply::ServerStatus,
+                "input={input}"
+            );
+        }
+        // 帮助里列出该指令。
+        let Reply::Text(text) = dispatch("/帮助", 0, 0).unwrap() else {
+            panic!("帮助 must reply");
+        };
+        assert!(text.contains("/对局"), "help missing /对局: {text}");
     }
 
     #[test]
