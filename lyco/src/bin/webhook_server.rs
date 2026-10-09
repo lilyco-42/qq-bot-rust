@@ -28,6 +28,9 @@
 //! | `WEBHOOK_STATUS` | `1` | 是否启用 `/对局` 服务器状态查询（`0` 关闭） |
 //! | `SP_STATUS_URL` | `https://sp.lain42.top/healthz` | 游戏服务器状态地址 |
 //! | `LOBBY_BASE_URL` | `https://sp.lain42.top/lobby` | 组队大厅基地址（读其公开计数） |
+//! | `WEBHOOK_LOBBY` | `1` | 是否启用 `/房间` 组队大厅房间查询（`0` 关闭） |
+//! | `LOBBY_USER` | — | 大厅机器人专用账号（与 `LOBBY_PASS` 同时设置才启用） |
+//! | `LOBBY_PASS` | — | 大厅机器人专用密码（运行时注入，永不进日志） |
 
 use qq_bot_rust::api;
 use qq_bot_rust::callback::{self, OP_CHALLENGE, OP_EVENT};
@@ -77,6 +80,10 @@ struct Config {
     qa: QaConfig,
     /// 服务器状态查询配置（`/对局`）。
     status: StatusConfig,
+    /// 组队大厅房间查询配置（`/房间`）。
+    lobby: LobbyConfig,
+    /// 大厅登录会话缓存（access/refresh token；锁内仅指针级存取，网络 I/O 不持锁）。
+    lobby_session: Arc<Mutex<Option<LobbySession>>>,
 }
 
 /// 缓存的 AppAccessToken 及其绝对过期时刻（unix 秒）。
@@ -118,6 +125,8 @@ enum ReplyBody {
     Ask(String),
     /// 需要查询服务器状态（`/对局`），由接收端发 HTTP 请求后成文。
     ServerStatus,
+    /// 需要查询组队大厅房间列表（`/房间`），由接收端带 token 请求后成文。
+    LobbyRooms,
 }
 
 impl ReplyJob {
@@ -153,6 +162,30 @@ struct StatusConfig {
     game_url: String,
     /// 组队大厅基地址（其 `/api/*` 与网页入口）。
     lobby_base: String,
+}
+
+/// 组队大厅房间查询配置（`/房间`：`WEBHOOK_LOBBY` / `LOBBY_USER` / `LOBBY_PASS`）。
+///
+/// 需要机器人专用账号：`POST {base}/api/login` 取 access token，再以
+/// `Authorization: Bearer <token>` 读 `GET {base}/api/rooms`——只读接口，
+/// 不改动大厅/游戏服务器。
+#[derive(Clone)]
+struct LobbyConfig {
+    /// 是否启用（`WEBHOOK_LOBBY=0` 或账号/密码缺失时为关闭）。
+    enabled: bool,
+    /// 机器人专用账号。
+    user: String,
+    /// 机器人专用密码（`SecretString`：结构上不可能进日志）。
+    pass: SecretString,
+}
+
+/// 大厅登录会话（access/refresh token 均为凭证，按 `SecretString` 脱敏）。
+#[derive(Clone)]
+struct LobbySession {
+    /// 短期访问令牌（`Authorization: Bearer`）。
+    access: SecretString,
+    /// 长期续期令牌（轮换式；换新后需回写缓存）。
+    refresh: SecretString,
 }
 
 /// 出站失败分类（排障日志 + 401 有界重试判定）。
@@ -279,6 +312,18 @@ fn run() -> Result<(), String> {
         lobby_base: std::env::var("LOBBY_BASE_URL")
             .unwrap_or_else(|_| "https://sp.lain42.top/lobby".to_string()),
     };
+    // 组队大厅房间查询：默认开启；`WEBHOOK_LOBBY=0` 或账号/密码缺失时关闭。
+    let lobby_user = std::env::var("LOBBY_USER").unwrap_or_default();
+    let lobby_pass = std::env::var("LOBBY_PASS").unwrap_or_default();
+    let lobby = LobbyConfig {
+        enabled: std::env::var("WEBHOOK_LOBBY")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+            && !lobby_user.is_empty()
+            && !lobby_pass.is_empty(),
+        user: lobby_user,
+        pass: SecretString::new(lobby_pass),
+    };
     let config = Config {
         secret: SecretString::new(secret_value),
         print_events: std::env::var("WEBHOOK_PRINT_EVENTS")
@@ -294,6 +339,8 @@ fn run() -> Result<(), String> {
         token: Arc::new(Mutex::new(None)),
         qa,
         status,
+        lobby,
+        lobby_session: Arc::new(Mutex::new(None)),
     };
     let bind = std::env::var("WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
@@ -315,12 +362,14 @@ fn run() -> Result<(), String> {
     logln(
         "INFO",
         &format!(
-            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={} qa={}",
+            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={} qa={} status={} lobby={}",
             config.app_id.as_deref().unwrap_or("-"),
             hex_encode(&pubkey),
             config.print_events,
             config.can_reply(),
             if config.qa.enabled { "on" } else { "off" },
+            if config.status.enabled { "on" } else { "off" },
+            if config.lobby.enabled { "on" } else { "off" },
         ),
     );
 
@@ -612,6 +661,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         CommandReply::Text(text) => ReplyBody::Text(text),
         CommandReply::Ask(question) => ReplyBody::Ask(question),
         CommandReply::ServerStatus => ReplyBody::ServerStatus,
+        CommandReply::LobbyRooms => ReplyBody::LobbyRooms,
         CommandReply::Skip => return Ok(None),
     };
     Ok(Some(ReplyJob {
@@ -650,6 +700,7 @@ fn reply_worker(config: Config, body: Vec<u8>) {
         ReplyBody::Text(text) => text.clone(),
         ReplyBody::Ask(question) => answer_question(&config, &label, question),
         ReplyBody::ServerStatus => server_status(&config, &label),
+        ReplyBody::LobbyRooms => lobby_rooms(&config, &label),
     };
     let outcome = match send_reply(&config, &job, &text, false) {
         Ok(reply_id) => Ok(reply_id),
@@ -852,6 +903,442 @@ fn json_int(body: &str, key: &str) -> Option<i64> {
                 && let Ok(value) = digits.parse::<i64>()
             {
                 return Some(value);
+            }
+        }
+        from = after;
+    }
+    None
+}
+
+/// 单条回复里最多列出的等待房间数。
+const MAX_ROOM_LINES: usize = 8;
+
+/// 组队大厅房间列表：用机器人专用账号登录取 token，只读 `GET /api/rooms` 后成文。
+///
+/// token 命中缓存直接复用；`/api/rooms` 返回 401（token 失效）时先用
+/// refresh_token 换新（轮换式）或重新登录，再有界重试一次。任一环节失败都
+/// 记 WARN 并回显式兜底文案（不吞错，不装死）。
+fn lobby_rooms(config: &Config, label: &str) -> String {
+    if !config.lobby.enabled {
+        return String::from("组队大厅房间查询未启用（/帮助 查看指令）");
+    }
+    let started = std::time::Instant::now();
+    let base = config.status.lobby_base.trim_end_matches('/');
+    let url = format!("{base}/api/rooms");
+    let mut session = match lobby_session(config) {
+        Ok(session) => session,
+        Err(err) => {
+            logln("WARN", &format!("lobby login failed: {err}"));
+            return String::from("组队大厅暂时不可用，请稍后再试");
+        }
+    };
+    let mut fetched = http_get_status(&config.agent, &url, Some(&session.access));
+    if let Ok((401, _)) = &fetched {
+        logln("INFO", "lobby token expired, renewing and retrying once");
+        match lobby_renew(config, &session) {
+            Ok(renewed) => {
+                store_lobby_session(config, &renewed);
+                session = renewed;
+                fetched = http_get_status(&config.agent, &url, Some(&session.access));
+            }
+            Err(err) => {
+                logln("WARN", &format!("lobby session renew failed: {err}"));
+                fetched = Err(err);
+            }
+        }
+    }
+    let text = match fetched {
+        Ok((200, body)) => match compose_rooms(&body, base) {
+            Ok(text) => text,
+            Err(err) => {
+                logln("WARN", &format!("lobby rooms parse failed: {err}"));
+                String::from("组队大厅房间数据解析失败，请稍后再试")
+            }
+        },
+        Ok((status, body)) => {
+            logln(
+                "WARN",
+                &format!(
+                    "lobby rooms status {status}: {}",
+                    sanitize_text(body.as_bytes(), 120)
+                ),
+            );
+            String::from("组队大厅暂时不可用，请稍后再试")
+        }
+        Err(err) => {
+            logln("WARN", &format!("lobby rooms fetch failed: {err}"));
+            String::from("组队大厅暂时不可用，请稍后再试")
+        }
+    };
+    logln(
+        "INFO",
+        &format!(
+            "lobby rooms queried event={label} ms={}",
+            started.elapsed().as_millis()
+        ),
+    );
+    text
+}
+
+/// 取大厅会话：命中缓存直接用，否则登录取新并写缓存。
+fn lobby_session(config: &Config) -> Result<LobbySession, String> {
+    if let Some(session) = cached_lobby_session(config) {
+        return Ok(session);
+    }
+    let session = lobby_login(config)?;
+    store_lobby_session(config, &session);
+    Ok(session)
+}
+
+/// 续期大厅会话：优先用 refresh_token 换新，失败则重新登录（有界，不循环）。
+fn lobby_renew(config: &Config, session: &LobbySession) -> Result<LobbySession, String> {
+    if !session.refresh.is_empty() {
+        match lobby_refresh(config, session.refresh.expose()) {
+            Ok(renewed) => return Ok(renewed),
+            Err(err) => logln("WARN", &format!("lobby refresh failed, re-login: {err}")),
+        }
+    }
+    lobby_login(config)
+}
+
+/// `POST {base}/api/login` → 解析 access/refresh token。
+fn lobby_login(config: &Config) -> Result<LobbySession, String> {
+    let base = config.status.lobby_base.trim_end_matches('/');
+    let payload = format!(
+        "{{\"username\":\"{}\",\"password\":\"{}\"}}",
+        json_escape(&config.lobby.user),
+        json_escape(config.lobby.pass.expose()),
+    );
+    let (status, body) = http_post_status(&config.agent, &format!("{base}/api/login"), &payload)?;
+    if status != 200 {
+        return Err(format!(
+            "login status {status}: {}",
+            sanitize_text(body.as_bytes(), 120)
+        ));
+    }
+    parse_lobby_session(&body)
+}
+
+/// `POST {base}/api/refresh` → 解析轮换后的 access/refresh token。
+fn lobby_refresh(config: &Config, refresh_token: &str) -> Result<LobbySession, String> {
+    let base = config.status.lobby_base.trim_end_matches('/');
+    let payload = format!("{{\"refresh_token\":\"{}\"}}", json_escape(refresh_token));
+    let (status, body) = http_post_status(&config.agent, &format!("{base}/api/refresh"), &payload)?;
+    if status != 200 {
+        return Err(format!(
+            "refresh status {status}: {}",
+            sanitize_text(body.as_bytes(), 120)
+        ));
+    }
+    parse_lobby_session(&body)
+}
+
+/// 从登录/续期应答里取 token（缺 access_token 视为失败，不降级）。
+fn parse_lobby_session(body: &str) -> Result<LobbySession, String> {
+    let access = callback::json_top_text(body.as_bytes(), b"access_token")
+        .map_err(|err| format!("parse access_token: {err}"))?
+        .ok_or_else(|| "login response missing access_token".to_string())?;
+    let refresh = callback::json_top_text(body.as_bytes(), b"refresh_token")
+        .map_err(|err| format!("parse refresh_token: {err}"))?
+        .unwrap_or_default();
+    Ok(LobbySession {
+        access: SecretString::new(access),
+        refresh: SecretString::new(refresh),
+    })
+}
+
+/// 读会话缓存（锁中毒时取回内部值继续，绝不 panic）。
+fn cached_lobby_session(config: &Config) -> Option<LobbySession> {
+    let guard = match config.lobby_session.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.clone()
+}
+
+/// 写会话缓存（锁中毒时取回内部值继续，绝不 panic）。
+fn store_lobby_session(config: &Config, session: &LobbySession) {
+    let mut guard = match config.lobby_session.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(session.clone());
+}
+
+/// 带可选 Bearer token 的 GET：返回 `(status, body)`；非 2xx 也取回 body（不丢信息）。
+fn http_get_status(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&SecretString>,
+) -> Result<(u16, String), String> {
+    let mut builder = agent.get(url);
+    if let Some(token) = token {
+        builder = builder.set("Authorization", &format!("Bearer {}", token.expose()));
+    }
+    match builder.call() {
+        Ok(response) => Ok((
+            response.status(),
+            response
+                .into_string()
+                .map_err(|err| format!("read body: {err}"))?,
+        )),
+        Err(ureq::Error::Status(status, response)) => {
+            Ok((status, response.into_string().unwrap_or_default()))
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// POST JSON：返回 `(status, body)`；非 2xx 也取回 body（不丢信息）。
+fn http_post_status(
+    agent: &ureq::Agent,
+    url: &str,
+    payload: &str,
+) -> Result<(u16, String), String> {
+    match agent
+        .post(url)
+        .set("Content-Type", "application/json; charset=utf-8")
+        .send_string(payload)
+    {
+        Ok(response) => Ok((
+            response.status(),
+            response
+                .into_string()
+                .map_err(|err| format!("read body: {err}"))?,
+        )),
+        Err(ureq::Error::Status(status, response)) => {
+            Ok((status, response.into_string().unwrap_or_default()))
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// JSON 字符串内容转义（不含包裹引号）：防登录/续期请求体注入。
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// 一轮房间的展示字段（`/api/rooms` 顶层数组项）。
+struct LobbyRoom {
+    name: String,
+    room_type: String,
+    game_status: String,
+    creator: String,
+    owner_online: bool,
+    member_count: i64,
+    max_players: i64,
+}
+
+/// 解析 `/api/rooms` 应答并渲染为回复文本（纯函数，无 IO，便于单测）。
+fn compose_rooms(body: &str, link_base: &str) -> Result<String, String> {
+    let objects = json_array_objects(body, "rooms")?
+        .ok_or_else(|| "response missing rooms array".to_string())?;
+    let mut rooms = Vec::with_capacity(objects.len());
+    for object in objects {
+        rooms.push(parse_room(object)?);
+    }
+    Ok(render_rooms(&rooms, link_base))
+}
+
+/// 从单个房间对象取展示字段（字符串经库内 `json_top_text` 解码转义）。
+fn parse_room(object: &str) -> Result<LobbyRoom, String> {
+    Ok(LobbyRoom {
+        name: json_text(object, "name")?.unwrap_or_default(),
+        room_type: json_text(object, "room_type")?.unwrap_or_default(),
+        game_status: json_text(object, "game_status")?.unwrap_or_default(),
+        creator: json_text(object, "creator_nickname")?.unwrap_or_else(|| String::from("未知")),
+        owner_online: json_bool(object, "is_owner_online").unwrap_or(false),
+        member_count: json_int(object, "member_count").unwrap_or(0),
+        max_players: json_int(object, "max_players").unwrap_or(0),
+    })
+}
+
+/// 渲染房间列表：突出「等待中」的房间，附带进行中数量与大厅入口。
+fn render_rooms(rooms: &[LobbyRoom], link_base: &str) -> String {
+    let waiting: Vec<&LobbyRoom> = rooms
+        .iter()
+        .filter(|room| room.game_status == "waiting")
+        .collect();
+    let playing = rooms
+        .iter()
+        .filter(|room| room.game_status == "playing")
+        .count();
+    let mut lines: Vec<String> = vec![String::from("🏠 组队大厅 · 等待中的房间")];
+    if waiting.is_empty() {
+        lines.push(String::from("当前没有等待中的房间，快去开一个吧"));
+    } else {
+        for room in waiting.iter().take(MAX_ROOM_LINES) {
+            lines.push(format_room(room));
+        }
+        if waiting.len() > MAX_ROOM_LINES {
+            lines.push(format!("…… 还有 {} 个房间", waiting.len() - MAX_ROOM_LINES));
+        }
+    }
+    if playing > 0 {
+        lines.push(format!("进行中：{playing} 个房间"));
+    }
+    if !link_base.is_empty() {
+        lines.push(format!("前往大厅：{link_base}/"));
+    }
+    lines.join("\n")
+}
+
+/// 单个房间一行：名称、公开/私密、人数、房主与在线状态。
+fn format_room(room: &LobbyRoom) -> String {
+    let kind = if room.room_type == "private" {
+        "私密"
+    } else {
+        "公开"
+    };
+    let owner = if room.owner_online {
+        "在线"
+    } else {
+        "离线"
+    };
+    format!(
+        "· {} [{kind}] {}/{} 人 · 房主 {}（{owner}）",
+        room.name, room.member_count, room.max_players, room.creator
+    )
+}
+
+/// 取 `"key":[...]` 顶层数组里的对象切片（字符串感知，容忍对象内嵌套）。
+///
+/// key 不存在 → `Ok(None)`；值不是数组、或数组项不是对象 → 报错（严格模式：
+/// 宁可拒绝也不猜结构）。
+fn json_array_objects<'a>(body: &'a str, key: &str) -> Result<Option<Vec<&'a str>>, String> {
+    let bytes = body.as_bytes();
+    let needle = format!("\"{key}\"");
+    let Some(offset) = body.find(&needle) else {
+        return Ok(None);
+    };
+    let mut i = skip_ws(bytes, offset + needle.len());
+    if bytes.get(i) != Some(&b':') {
+        return Err(format!("{key}: missing ':'"));
+    }
+    i = skip_ws(bytes, i + 1);
+    if bytes.get(i) != Some(&b'[') {
+        return Err(format!("{key}: not an array"));
+    }
+    i += 1;
+    let mut objects = Vec::new();
+    loop {
+        i = skip_array_sep(bytes, i);
+        match bytes.get(i) {
+            None | Some(&b']') => break,
+            Some(&b'{') => {
+                let end = scan_object_end(bytes, i)
+                    .ok_or_else(|| format!("{key}: unterminated object"))?;
+                objects.push(&body[i..=end]);
+                i = end + 1;
+            }
+            Some(_) => return Err(format!("{key}: array item is not an object")),
+        }
+    }
+    Ok(Some(objects))
+}
+
+/// 跳过空白（不含逗号）。
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// 跳过数组项之间的空白与逗号。
+fn skip_array_sep(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b',') {
+        i += 1;
+    }
+    i
+}
+
+/// 返回与 `bytes[start]`（`{`）匹配的 `}` 下标；字符串内的花括号不计。
+fn scan_object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_string(bytes, i)?,
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 跳过 `bytes[quote]`（开引号）处的字符串，返回闭引号后的下标。
+fn skip_string(bytes: &[u8], quote: usize) -> Option<usize> {
+    let mut i = quote + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 取字符串字段值（`null` 视作缺省；其余交库内 `json_top_text` 严格解码转义）。
+fn json_text(object: &str, key: &str) -> Result<Option<String>, String> {
+    if json_value_is_null(object, key) {
+        return Ok(None);
+    }
+    callback::json_top_text(object.as_bytes(), key.as_bytes())
+        .map_err(|err| format!("parse {key}: {err}"))
+}
+
+/// 判定 `"key"` 的值是否为 `null`（`json_top_text` 会把 null 当形态错误）。
+fn json_value_is_null(object: &str, key: &str) -> bool {
+    let needle = format!("\"{key}\"");
+    let Some(offset) = object.find(&needle) else {
+        return false;
+    };
+    match object[offset + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')
+    {
+        Some(value) => value.trim_start().starts_with("null"),
+        None => false,
+    }
+}
+
+/// 从扁平 JSON 文本里读一个布尔字段（键后必须跟 `:`；无 serde 依赖）。
+fn json_bool(object: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(offset) = object[from..].find(&needle) {
+        let after = from + offset + needle.len();
+        if let Some(rest) = object[after..].trim_start().strip_prefix(':') {
+            let rest = rest.trim_start();
+            if rest.starts_with("true") {
+                return Some(true);
+            }
+            if rest.starts_with("false") {
+                return Some(false);
             }
         }
         from = after;
@@ -1198,6 +1685,13 @@ mod tests {
                 game_url: "http://127.0.0.1:1/healthz".to_string(),
                 lobby_base: "http://127.0.0.1:1/lobby".to_string(),
             },
+            // 房间查询默认关闭：单测不发网络请求。
+            lobby: super::LobbyConfig {
+                enabled: false,
+                user: String::new(),
+                pass: SecretString::new(String::new()),
+            },
+            lobby_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1350,6 +1844,7 @@ mod tests {
             super::ReplyBody::Text(text) => text,
             super::ReplyBody::Ask(question) => panic!("expected Text, got Ask({question})"),
             super::ReplyBody::ServerStatus => panic!("expected Text, got ServerStatus"),
+            super::ReplyBody::LobbyRooms => panic!("expected Text, got LobbyRooms"),
         }
     }
 
@@ -1502,6 +1997,206 @@ mod tests {
         // 单测配置 status.enabled=false → 不触网，直接给提示。
         let text = super::server_status(&config(), "TEST");
         assert!(text.contains("未启用"), "text={text}");
+    }
+
+    #[test]
+    fn lobby_rooms_disabled_returns_hint_without_network() {
+        // 单测配置 lobby.enabled=false → 不触网，直接给提示。
+        let text = super::lobby_rooms(&config(), "TEST");
+        assert!(text.contains("未启用"), "text={text}");
+    }
+
+    /// 读取一条完整的 HTTP 请求（头 + 按 Content-Length 读完请求体）。
+    fn read_full_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let mut header_end = None;
+        while header_end.is_none() {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = super::find_bytes(&buf, b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                    }
+                }
+            }
+        }
+        if let Some(header_end) = header_end {
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+            let clen = head
+                .split("content-length:")
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(|c: char| !c.is_ascii_digit())
+                        .find(|s| !s.is_empty())
+                })
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + clen {
+                match stream.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+        }
+        buf
+    }
+
+    /// 假登录/续期应答（带 access/refresh token）。
+    const MOCK_LOGIN: &str =
+        r#"{"access_token":"mock-access","refresh_token":"mock-refresh","expires_in":1800}"#;
+    /// 假房间列表（一个等待中的房间）。
+    const MOCK_ROOMS: &str = r#"{"rooms":[{"id":7,"name":"waitroom","creator_nickname":"bot","member_count":1,"max_players":4,"room_type":"public","game_status":"waiting","is_owner_online":true}]}"#;
+
+    /// 起一个最小 HTTP 假服务，返回其 `/lobby` 基地址。
+    ///
+    /// `/api/login`、`/api/refresh` → 200 + 伪造 token；`/api/rooms` → 当
+    /// `unauthorized_first` 时首次 401、其后 200 + 一个等待房间。
+    fn spawn_mock(unauthorized_first: bool) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let rooms_calls = AtomicUsize::new(0);
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let buf = read_full_request(&mut stream);
+                let line_end = super::find_bytes(&buf, b"\r\n").unwrap_or(buf.len());
+                let request_line = String::from_utf8_lossy(&buf[..line_end]).to_string();
+                let (status, reason, body) = if request_line.contains("/api/login")
+                    || request_line.contains("/api/refresh")
+                {
+                    (200u16, "OK", MOCK_LOGIN)
+                } else if request_line.contains("/api/rooms") {
+                    if unauthorized_first && rooms_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (401, "Unauthorized", "{}")
+                    } else {
+                        (200, "OK", MOCK_ROOMS)
+                    }
+                } else {
+                    (404, "Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/lobby")
+    }
+
+    fn lobby_config(base: String) -> Config {
+        let mut config = config();
+        config.lobby = super::LobbyConfig {
+            enabled: true,
+            user: "qqbot".to_string(),
+            pass: SecretString::new("pw".to_string()),
+        };
+        config.status.lobby_base = base;
+        config
+    }
+
+    #[test]
+    fn lobby_rooms_logs_in_and_lists_rooms() {
+        // 全链路：登录取 token → 带 Bearer 读房间 → 成文（走真实 ureq + 假服务）。
+        let config = lobby_config(spawn_mock(false));
+        let text = super::lobby_rooms(&config, "TEST");
+        assert!(text.contains("waitroom"), "text={text}");
+        assert!(text.contains("房主 bot（在线）"), "text={text}");
+        assert!(text.contains("1/4 人"), "text={text}");
+    }
+
+    #[test]
+    fn lobby_rooms_renews_and_retries_on_401() {
+        // 首次房间请求 401 → refresh_token 换新 → 重试一次成功。
+        let config = lobby_config(spawn_mock(true));
+        let text = super::lobby_rooms(&config, "TEST");
+        assert!(text.contains("waitroom"), "text={text}");
+    }
+
+    #[test]
+    fn plan_reply_routes_lobby_command() {
+        // `/房间`（UTF-8）→ LobbyRooms，目标仍为单聊。
+        let body = b"{\"op\":0,\"id\":\"C2C_MESSAGE_CREATE:g\",\"d\":{\"author\":{\"id\":\"79BE\",\"user_openid\":\"79BE66EF\"},\"content\":\"/\xe6\x88\xbf\xe9\x97\xb4\",\"id\":\"ROBOT1.0_grp\",\"message_type\":0},\"t\":\"C2C_MESSAGE_CREATE\",\"seq\":1}";
+        let job = plan_reply(body, 0, 0)
+            .unwrap()
+            .expect("/房间 must plan a reply");
+        assert!(matches!(job.body, super::ReplyBody::LobbyRooms));
+    }
+
+    #[test]
+    fn json_escape_escapes_quotes_and_controls() {
+        assert_eq!(super::json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(super::json_escape("行1\n行2\t"), "行1\\n行2\\t");
+        assert_eq!(super::json_escape("\u{1}"), "\\u0001");
+    }
+
+    #[test]
+    fn compose_rooms_lists_waiting_and_hides_finished() {
+        // 中文按 Flask 默认 ensure_ascii 转义为 \uXXXX；null 昵称 → 未知。
+        let body = r#"{"rooms":[{"id":1,"name":"已结束房","creator_nickname":"z","created_at":"2026-10-05T14:36:32.122779","member_count":1,"max_players":4,"room_type":"public","game_status":"finished","is_owner_online":false},{"id":2,"name":"\u4e0a\u5206\u8f66\u961f","creator_nickname":null,"member_count":2,"max_players":4,"room_type":"private","game_status":"waiting","is_owner_online":true},{"id":3,"name":"playing","creator_nickname":"a","member_count":4,"max_players":4,"room_type":"public","game_status":"playing","is_owner_online":true}]}"#;
+        let text = super::compose_rooms(body, "https://sp.lain42.top/lobby").unwrap();
+        assert!(text.contains("上分车队"), "unicode name missing: {text}");
+        assert!(text.contains("[私密]"), "room_type missing: {text}");
+        assert!(text.contains("2/4 人"), "member count missing: {text}");
+        assert!(
+            text.contains("房主 未知（在线）"),
+            "null creator missing: {text}"
+        );
+        assert!(
+            text.contains("进行中：1 个房间"),
+            "playing line missing: {text}"
+        );
+        assert!(
+            text.contains("https://sp.lain42.top/lobby"),
+            "link missing: {text}"
+        );
+        // 已结束的房间不出现在等待列表里。
+        assert!(!text.contains("已结束房"), "finished room leaked: {text}");
+    }
+
+    #[test]
+    fn compose_rooms_handles_empty_and_empty_link() {
+        let text = super::compose_rooms(r#"{"rooms":[]}"#, "").unwrap();
+        assert!(text.contains("没有等待中的房间"), "text={text}");
+        assert!(
+            !text.contains("前往大厅"),
+            "empty link must be omitted: {text}"
+        );
+    }
+
+    #[test]
+    fn json_array_objects_is_string_and_nesting_aware() {
+        // 对象内含嵌套数组 + 字符串里的花括号，不应截断对象。
+        let body = r#"{"rooms":[{"name":"a}b","members":[{"id":1}]},{"name":"c"}]}"#;
+        let objects = super::json_array_objects(body, "rooms").unwrap().unwrap();
+        assert_eq!(objects.len(), 2);
+        assert!(objects[0].contains("\"members\""));
+        assert!(objects[0].ends_with('}'));
+        // 键不存在 → None；值非法形态 → 报错（严格模式）。
+        assert!(super::json_array_objects("{}", "rooms").unwrap().is_none());
+        assert!(super::json_array_objects(r#"{"rooms":5}"#, "rooms").is_err());
+        assert!(super::json_array_objects(r#"{"rooms":[1]}"#, "rooms").is_err());
+    }
+
+    #[test]
+    fn json_bool_reads_flat_fields() {
+        assert_eq!(
+            super::json_bool(r#"{"is_owner_online":true}"#, "is_owner_online"),
+            Some(true)
+        );
+        assert_eq!(
+            super::json_bool(r#"{"is_owner_online": false}"#, "is_owner_online"),
+            Some(false)
+        );
+        assert_eq!(
+            super::json_bool(r#"{"is_owner_online":null}"#, "is_owner_online"),
+            None
+        );
+        assert_eq!(super::json_bool("{}", "is_owner_online"), None);
     }
 
     #[test]

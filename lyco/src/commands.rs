@@ -23,6 +23,11 @@ pub enum Reply {
     /// 分发层保持纯函数（无 IO）：只声明意图，实际请求在接收端完成，
     /// 与 [`Reply::Ask`] 同一模式。
     ServerStatus,
+    /// 需要查询组队大厅房间列表（等待中的房间），由调用方发起网络请求。
+    ///
+    /// 与 [`Reply::ServerStatus`] 同一模式：分发层无 IO，只声明意图；
+    /// 实际请求（需机器人专用账号登录）在接收端完成。
+    LobbyRooms,
     /// 不需要回复（如空内容、无法构成回复的输入）。
     Skip,
 }
@@ -56,6 +61,8 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "复读" | "echo" => Reply::Text(echo_reply(rest)),
         // 服务器对局/等待状态：声明意图，网络请求在接收端完成。
         "对局" | "状态" | "服务器" | "status" | "server" => Reply::ServerStatus,
+        // 组队大厅房间列表（等待中的房间）：需机器人专用账号，请求在接收端完成。
+        "房间" | "组队" | "大厅" | "rooms" | "lobby" => Reply::LobbyRooms,
         _ => Reply::Text(String::from("未识别指令。发送「/帮助」查看可用指令")),
     };
     Ok(reply)
@@ -70,6 +77,7 @@ fn help_text() -> String {
          /随机 [n] — 1..=n 随机数（默认 100）\n\
          /复读 <文本> — 原样返回（≤140 字）\n\
          /对局 — 服务器对局/等待状态\n\
+         /房间 — 组队大厅等待中的房间\n\
          /关于 — 版本信息\n\
          直接发文字可向 AI 提问",
     )
@@ -255,6 +263,23 @@ mod tests {
             panic!("帮助 must reply");
         };
         assert!(text.contains("/对局"), "help missing /对局: {text}");
+    }
+
+    #[test]
+    fn lobby_command_declares_room_query() {
+        // `/房间` 及别名 → LobbyRooms（由接收端带账号登录取房间列表）。
+        for input in ["/房间", "/组队", "/大厅", "/rooms", "/lobby", "  /房间  "] {
+            assert_eq!(
+                dispatch(input, 0, 0).unwrap(),
+                Reply::LobbyRooms,
+                "input={input}"
+            );
+        }
+        // 帮助里列出该指令。
+        let Reply::Text(text) = dispatch("/帮助", 0, 0).unwrap() else {
+            panic!("帮助 must reply");
+        };
+        assert!(text.contains("/房间"), "help missing /房间: {text}");
     }
 
     #[test]
