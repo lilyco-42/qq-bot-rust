@@ -25,6 +25,8 @@
 //! | `ZEROSTACK_BIN` | `zerostack` | zerostack 可执行文件（空串等价于关闭问答） |
 //! | `QA_TIMEOUT_SECS` | `120` | 单次问答超时（5..=600 秒，超时回兜底文案） |
 //! | `QA_MAX_CHARS` | `1000` | 回答截断字数（50..=4000；平台无公开上限，保守截断） |
+//! | `QA_PROVIDER` | （zerostack 配置） | 覆盖 zerostack provider（`--provider`，如 `nim`/`openrouter`） |
+//! | `QA_MODEL` | （zerostack 配置） | 覆盖 zerostack model（`--model`，如 `nvidia/nemotron-3-super-120b-a12b`） |
 //! | `WEBHOOK_STATUS` | `1` | 是否启用 `/对局` 服务器状态查询（`0` 关闭） |
 //! | `SP_STATUS_URL` | `https://sp.lain42.top/healthz` | 游戏服务器状态地址 |
 //! | `LOBBY_BASE_URL` | `https://sp.lain42.top/lobby` | 组队大厅基地址（读其公开计数） |
@@ -137,7 +139,8 @@ impl ReplyJob {
 }
 
 #[derive(Clone)]
-/// AI 问答配置（`WEBHOOK_QA` / `ZEROSTACK_BIN` / `QA_TIMEOUT_SECS` / `QA_MAX_CHARS`）。
+/// AI 问答配置（`WEBHOOK_QA` / `ZEROSTACK_BIN` / `QA_TIMEOUT_SECS` / `QA_MAX_CHARS` /
+/// `QA_PROVIDER` / `QA_MODEL`）。
 struct QaConfig {
     /// 是否启用问答（`WEBHOOK_QA=0` 关闭）。
     enabled: bool,
@@ -147,6 +150,10 @@ struct QaConfig {
     timeout: Duration,
     /// 回答截断上限（字数；平台无公开上限，保守截断）。
     max_chars: usize,
+    /// 覆盖 zerostack provider（`--provider`）；`None` 时用其 `config.toml`。
+    provider: Option<String>,
+    /// 覆盖 zerostack model（`--model`）；`None` 时用其 `config.toml`。
+    model: Option<String>,
 }
 
 /// 服务器状态查询配置（`/对局`：`WEBHOOK_STATUS` / `SP_STATUS_URL` / `LOBBY_BASE_URL`）。
@@ -296,11 +303,22 @@ fn run() -> Result<(), String> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1_000);
+    // provider/model 覆盖：留空则沿用 zerostack `config.toml` 的默认（不传 `--provider/--model`）。
+    let qa_provider = std::env::var("QA_PROVIDER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let qa_model = std::env::var("QA_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let qa = QaConfig {
         enabled: qa_enabled && !qa_bin.is_empty(),
         bin: qa_bin,
         timeout: Duration::from_secs(qa_timeout_secs.clamp(5, 600)),
         max_chars: qa_max_chars.clamp(50, 4_000),
+        provider: qa_provider,
+        model: qa_model,
     };
     // 服务器状态查询：默认开启；`WEBHOOK_STATUS=0` 关闭。地址可换成自建服。
     let status = StatusConfig {
@@ -1346,6 +1364,31 @@ fn json_bool(object: &str, key: &str) -> Option<bool> {
     None
 }
 
+/// 组装 zerostack 单次问答参数（`-p` 打印回答；`--no-tools` 单轮纯问答）。
+///
+/// provider/model 覆盖来自 `QA_PROVIDER`/`QA_MODEL`，让同一部署在 NIM / OpenRouter
+/// 等后端间切换，无需改 zerostack 的 `config.toml`（`None` 时沿用其默认）。
+fn qa_args(config: &Config, question: &str) -> Vec<String> {
+    let mut args = vec![
+        "--no-tools".to_string(),
+        "--no-context-files".to_string(),
+        // 临时模式：不落会话文件（问答为一次性调用，避免数据目录无限增长）。
+        "--no-session".to_string(),
+        "--no-color".to_string(),
+    ];
+    if let Some(provider) = &config.qa.provider {
+        args.push("--provider".to_string());
+        args.push(provider.clone());
+    }
+    if let Some(model) = &config.qa.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    args.push("-p".to_string());
+    args.push(question.to_string());
+    args
+}
+
 /// 执行 zerostack 单次问答（`-p` 打印回答到 stdout；`--no-tools` 单轮纯问答）。
 ///
 /// - 问答未启用 → Err（由 [`answer_question`] 转为提示文案）；
@@ -1356,15 +1399,7 @@ fn ask_zerostack(config: &Config, question: &str) -> Result<String, String> {
     if !config.qa.enabled {
         return Err("qa disabled".to_string());
     }
-    let args = [
-        "--no-tools".to_string(),
-        "--no-context-files".to_string(),
-        // 临时模式：不落会话文件（问答为一次性调用，避免数据目录无限增长）。
-        "--no-session".to_string(),
-        "--no-color".to_string(),
-        "-p".to_string(),
-        question.to_string(),
-    ];
+    let args = qa_args(config, question);
     let raw = run_capture(&config.qa.bin, &args, config.qa.timeout)?;
     let answer = clean_answer(&raw);
     if answer.is_empty() {
@@ -1678,6 +1713,8 @@ mod tests {
                 bin: String::new(),
                 timeout: std::time::Duration::from_secs(1),
                 max_chars: 100,
+                provider: None,
+                model: None,
             },
             // 状态查询默认关闭：单测不发网络请求。
             status: super::StatusConfig {
@@ -2205,6 +2242,40 @@ mod tests {
         let text = super::answer_question(&config(), "TEST", "任意问题");
         assert!(text.contains("AI 问答"), "text={text}");
         assert!(super::ask_zerostack(&config(), "q").is_err());
+    }
+
+    #[test]
+    fn qa_args_include_provider_and_model_overrides() {
+        let mut config = config();
+        config.qa.provider = Some("nim".to_string());
+        config.qa.model = Some("nvidia/nemotron-3-super-120b-a12b".to_string());
+        let args = super::qa_args(&config, "你好");
+        assert_eq!(
+            args,
+            vec![
+                "--no-tools",
+                "--no-context-files",
+                "--no-session",
+                "--no-color",
+                "--provider",
+                "nim",
+                "--model",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "-p",
+                "你好",
+            ]
+        );
+    }
+
+    #[test]
+    fn qa_args_omit_overrides_when_unset() {
+        let args = super::qa_args(&config(), "q");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--provider" || arg == "--model")
+        );
+        assert_eq!(args.last().map(String::as_str), Some("q"));
     }
 
     #[test]
