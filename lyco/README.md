@@ -40,6 +40,11 @@ QQ 机器人 OpenAPI SDK —— `no_std + alloc` 核心，wtx 生态传输层，
   字段时补报快速匹配队列，前向兼容 0.2.3），大厅 `/api/online_count` + `/api/active_rooms`
   给在线人数/房间数；三个请求相互独立，任一失败只少一行、全失败回显式兜底；
   地址经 `SP_STATUS_URL` / `LOBBY_BASE_URL` 可指向自建服；`cargo test` 66 项全绿）
+- [x] 组队大厅房间查询 `/房间`（别名 `/组队`、`/大厅`）：机器人专用账号登录后只读
+  `GET /lobby/api/rooms`，列出等待中的房间（名称/公开私密/人数/房主在线），
+  access token 缓存、401 时先用 refresh token 换新（轮换式）或重登后有界重试一次；
+  账号经 `LOBBY_USER` / `LOBBY_PASS` 注入（`SecretString`，永不进日志），
+  `WEBHOOK_LOBBY=0` 关闭；`cargo test` 78 项全绿）
 - [ ] WebSocket 兼容链路（官方已宣布下线，仅作过渡）
 
 ## Radxa 部署（aarch64，验收现场）
@@ -51,15 +56,19 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 # 凭证注入（env.sh，chmod 600，绝不进 ps 命令行/仓库）：
 #   export QQ_BOT_SECRET=...  export WEBHOOK_BIND=0.0.0.0:8080  export QQ_APPID=...
 #   export NIM_API_KEY=...          # AI 问答免费模型 key（同上，不进仓库/日志）
-#   export ZEROSTACK_BIN=~/qq_bot/zerostack_wrap.sh
+#   export ZEROSTACK_BIN=~/.local/bin/zerostack   # 直连 NIM 推理接口（无需代理）
 # 可选：WEBHOOK_QA=0 关问答；QA_TIMEOUT_SECS（默认120，5..=600）；QA_MAX_CHARS（默认1000，50..=4000）
+#   QA_PROVIDER / QA_MODEL 覆盖 zerostack 的 provider/model（切 NIM/OpenRouter；留空沿用 config.toml）
 # 可选：WEBHOOK_STATUS=0 关 /对局 状态查询；SP_STATUS_URL / LOBBY_BASE_URL 换自建服地址
+# 可选：WEBHOOK_LOBBY=0 关 /房间 房间查询；LOBBY_USER / LOBBY_PASS = 大厅机器人专用账号
 # AI 问答（zerostack v1.8.4，aarch64-musl 静态单二进制 → ~/.local/bin/）：
-#   ~/.config/zerostack/config.toml            # provider=nim（NIM 免费 deepseek 闪光模型）
+#   ~/.config/zerostack/config.toml            # provider=nim，model=nvidia/nemotron-3-super-120b-a12b
+#                                              #   2026-10 实测 Radxa 直连 ~3–6s、中文干净（旧
+#                                              #   deepseek-v4.1-flash 直连 POST 挂起，已弃用）
 #   ~/.local/share/zerostack/prompts/qqbot.md  # 回答风格 prompt（首行 %%mode=readonly）
-#   zerostack_wrap.sh                          # 出口包装：NIM 推理接口从 Radxa 直连挂起
-#     （GET/错误响应正常、有效模型 POST 无响应），仅对 zerostack 设 HTTPS_PROXY 走
-#     局域网代理；webhook_server/cloudflared 不继承，代理不可达时问答优雅降级
+#   切换后端：config.toml 内含 [custom_providers.openrouter]（openrouter.ai/api/v1，
+#     api_key_env=OPENROUTER_API_KEY）；env.sh 设 OPENROUTER_API_KEY + QA_PROVIDER=openrouter
+#     + QA_MODEL=<模型 id> 即可切到 OpenRouter，无需改代码
 # 启动（fd 全脱离，ssh 会话不挂起）：
 nohup sh -c 'cd ~/qq_bot && set -a && . ./env.sh && set +a && exec ./webhook_server >> server.log 2>&1' </dev/null >/dev/null 2>&1 &
 # 公网回调（无公网 IP 时的 cloudflared 快速隧道，URL 每次重启变化，需回控制台重配）：
