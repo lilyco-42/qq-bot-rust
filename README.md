@@ -81,13 +81,20 @@ Only transfer content you are authorized to access and store. The tool is unoffi
 @lyco bug记录 隐身怪会空放技能，主要是无伤害
 ```
 
-仅 **管理员授权 QQ 用户 OpenID** 能执行。服务端必须设置
+默认仅 **管理员授权 QQ 用户 OpenID** 能执行。服务端设置
 `GH_WRITE=1`、`GH_REPO=lilyco-42/Stronghold-Protocol`、
 `GH_ALLOWED_OPENIDS=<author.member_openid>`（多个用逗号分隔）。
+
+如需允许**普通群成员自助提单**，由管理员额外设置 `GH_GROUP_ISSUES=1` 并重启 Bot。
+群友必须通过已验签的 QQ 群事件触发 `/提单`，私聊无法提交。
+普通群友每 24 小时最多提交 2 次、两次间隔至少 15 分钟、所有群友
+每 24 小时合计最多 20 次；失败的提单尝试也占用频率额度，以防止重试风暴。
+限额记录默认写入 Bot 工作目录的 `issue-submissions.log`（0600）并在进程
+重启后保留。白名单管理员不受这些限额影响。`GH_GROUP_ISSUES` 默认关闭。
 `GH_TOKEN` 作为 QQ Bot **systemd 环境**内的机密变量提供；需要有目标仓库 Issue 写权限。
 这些值存入 `/home/radxa/qq_bot/env.sh`（仅 `radxa` 可读），禁止提交 GitHub。
 
-处理流程：QQ 校验签名 → 解析发送者 OpenID → 严格白名单 →
+处理流程：QQ 校验签名 → 解析发送者 OpenID → 管理员白名单或群友自助权限及持久限额 →
 ZeroStack (`--no-tools`) 把文本整理为待确认的描述 →
 `gh issue create --repo <固定仓库> --title ... --body ...` →
 QQ 回复真实 Issue URL。Issue 正文始终保留原始反馈，不接受模型产生的工具指令，

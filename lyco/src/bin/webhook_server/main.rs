@@ -44,6 +44,7 @@
 //! | `GH_REPO` | — | gh 目标仓库 `owner/repo`（`/issue` 检索、`/提单` 建单） |
 //! | `GH_WRITE` | `0` | gh 建单总开关，默认禁用 |
 //! | `GH_ALLOWED_OPENIDS` | — | 可在群内建 Issue 的 QQ 用户 OpenID 白名单，逗号分隔，必须配置 |
+//! | `GH_GROUP_ISSUES` | `0` | 允许所有经 QQ 验签的群成员自助提单，15 分钟冷却、每人每天 2 条、全群每天 20 条 |
 //! | `GH_ISSUE_AI` | `1` | 使用 ZeroStack 整理 Issue 描述；失败则保留原始反馈直接建单 |
 //! | `WEB_FETCH_ALLOW_PRIVATE` | `0` | `/网站` 是否允许抓取内网地址（防 SSRF，默认否） |
 //! | `MINECRAFT_API_URL` | — | 我的世界后台地址（`/mc`；未设置时明确提示未配置） |
@@ -66,6 +67,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod memory;
 #[cfg(feature = "tools")]
 mod tools;
+#[cfg(feature = "tools")]
+mod group_issue_limits;
 mod sp_rooms;
 mod quark_save;
 #[cfg(feature = "vision")]
@@ -1437,8 +1440,13 @@ fn issue_create_text(config: &Config, original: &str, actor: &str, is_group: boo
         return String::from("建单未启用：管理员需要设置 GH_WRITE=1。");
     }
     let allowed = std::env::var("GH_ALLOWED_OPENIDS").unwrap_or_default();
-    if !gh_actor_allowed(actor, &allowed) {
-        return String::from("仅已授权管理员可向 GitHub 提交 Issue。");
+    let is_admin = gh_actor_allowed(actor, &allowed);
+    let public_group_enabled = std::env::var("GH_GROUP_ISSUES").as_deref() == Ok("1");
+    if !is_admin && !public_group_enabled {
+        return String::from("仅已授权管理员可向 GitHub 提交 Issue（群友自助提单尚未开启）。");
+    }
+    if actor.is_empty() {
+        return String::from("无法确认 QQ 发送者身份，拒绝提单。");
     }
     if config.gh.repo.trim().is_empty() {
         return String::from("建单失败：GH_REPO 未配置。");
@@ -1458,6 +1466,13 @@ fn issue_create_text(config: &Config, original: &str, actor: &str, is_group: boo
         fn drop(&mut self) { self.0.store(false, Ordering::Release); }
     }
     let _guard = BusyGuard(&ISSUE_BUSY);
+    // Public group users use a durable, fail-closed budget. Whitelisted
+    // maintainers retain their existing unrestricted administrative access.
+    if !is_admin {
+        if let Err(why) = group_issue_limits::reserve(actor, unix_now()) {
+            return format!("群友自助提单暂不可用：{why}");
+        }
+    }
 
     let single_line = original.lines().next().unwrap_or(original).trim();
     let title: String = single_line.chars().take(100).collect();
