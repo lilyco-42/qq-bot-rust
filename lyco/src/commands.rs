@@ -77,10 +77,22 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
     // 群聊 @机器人 的内容通常没有 / 前缀；Bug 报告必须进入持久化记忆，
     // 不能误送给一次性 AI 问答。严守命令前缀边界，普通讨论不触发存储。
     fn normalize_bug(input: &str) -> Option<&str> {
-        ["bug记录", "BUG记录", "Bug记录", "bug反馈", "BUG反馈", "问题记录"]
-            .iter().find_map(|prefix| input.strip_prefix(prefix))
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)
-                || rest.starts_with(':') || rest.starts_with('：'))
+        [
+            "bug记录",
+            "BUG记录",
+            "Bug记录",
+            "bug反馈",
+            "BUG反馈",
+            "问题记录",
+        ]
+        .iter()
+        .find_map(|prefix| input.strip_prefix(prefix))
+        .filter(|rest| {
+            rest.is_empty()
+                || rest.starts_with(char::is_whitespace)
+                || rest.starts_with(':')
+                || rest.starts_with('：')
+        })
     }
     if let Some(rest) = normalize_bug(text) {
         let details = rest.trim_start_matches(&[':', '：', ' ', '\t'][..]).trim();
@@ -106,7 +118,23 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
             };
             return Ok(remember_reply(fact));
         }
-        if text.contains("客户端") && (text.contains("最新版本") || text.contains("版本号"))
+        // QQ 群自然语言问版本时不应绕进通用 AI（容易答非所问，且慢）。
+        // 例如「客户端release好了么」「客户端发版了吗」「安装包下载」。
+        let lower = text.to_ascii_lowercase();
+        let asks_client_release = text.contains("客户端")
+            || text.contains("安装包")
+            || text.contains("安卓版")
+            || text.contains("APK");
+        if asks_client_release
+            && (text.contains("最新版本")
+                || text.contains("版本号")
+                || text.contains("发版")
+                || text.contains("发布")
+                || text.contains("下载")
+                || text.contains("出了吗")
+                || text.contains("好了么")
+                || text.contains("好了吗")
+                || lower.contains("release"))
         {
             return Ok(Reply::ClientRelease);
         }
@@ -129,15 +157,21 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "房间" | "组队" | "大厅" | "rooms" | "lobby" => Reply::LobbyRooms,
         "游戏房间" | "卫戍房间" | "sp房间" | "gamerooms" => Reply::StrongholdRooms,
         "夸克转存" | "网盘转存" | "quark-save" => {
-            if rest.is_empty() { Reply::Text("用法：/夸克转存 https://pan.quark.cn/s/分享ID".into()) }
-            else { Reply::QuarkSave(rest.chars().take(256).collect()) }
-        },
+            if rest.is_empty() {
+                Reply::Text("用法：/夸克转存 https://pan.quark.cn/s/分享ID".into())
+            } else {
+                Reply::QuarkSave(rest.chars().take(256).collect())
+            }
+        }
         // 记忆：写入/检索持久化记忆库（接收端完成；未启用 memory 时给出提示）。
         "记" | "记住" | "remember" => remember_reply(rest),
         "bug记录" | "bug反馈" | "BUG记录" | "bug" => {
-            if rest.is_empty() { Reply::Text("用法：/bug记录 <问题描述>".into()) }
-            else { issue_create_reply(&format!("[Bug] {rest}")) }
-        },
+            if rest.is_empty() {
+                Reply::Text("用法：/bug记录 <问题描述>".into())
+            } else {
+                issue_create_reply(&format!("[Bug] {rest}"))
+            }
+        }
         // 回忆：空关键词 = 概览（该作用域下最重要的若干条），故不判空。
         "忆" | "回忆" | "recall" => Reply::Recall(rest.to_string()),
         // 同类 issue 检索：本地记忆 + gh cli 搜仓库，接收端合并成文。
@@ -454,7 +488,10 @@ mod tests {
 
     #[test]
     fn quark_save_is_an_explicit_admin_write_intent() {
-        assert!(matches!(dispatch("/夸克转存", 0, 0).unwrap(), Reply::Text(_)));
+        assert!(matches!(
+            dispatch("/夸克转存", 0, 0).unwrap(),
+            Reply::Text(_)
+        ));
         assert_eq!(
             dispatch("/夸克转存 https://pan.quark.cn/s/abc123", 0, 0).unwrap(),
             Reply::QuarkSave("https://pan.quark.cn/s/abc123".into()),
@@ -476,7 +513,10 @@ mod tests {
             assert_eq!(dispatch(input, 0, 0).unwrap(), expected, "input={input}");
         }
         assert!(matches!(dispatch("bug记录", 0, 0).unwrap(), Reply::Text(_)));
-        assert!(matches!(dispatch("bug记录器是什么", 0, 0).unwrap(), Reply::Ask(_)));
+        assert!(matches!(
+            dispatch("bug记录器是什么", 0, 0).unwrap(),
+            Reply::Ask(_)
+        ));
     }
 
     #[test]
@@ -486,6 +526,19 @@ mod tests {
             dispatch("手机客户端最新版本是什么", 0, 0).unwrap(),
             Reply::ClientRelease
         );
+        for question in [
+            "客户端release好了么",
+            "客户端 Release 好了吗？",
+            "客户端发版了吗",
+            "安卓客户端发布了吗？",
+            "安装包下载地址",
+        ] {
+            assert_eq!(
+                dispatch(question, 0, 0).unwrap(),
+                Reply::ClientRelease,
+                "{question}"
+            );
+        }
         assert!(matches!(
             dispatch("客户端怎么安装", 0, 0).unwrap(),
             Reply::Ask(_)
