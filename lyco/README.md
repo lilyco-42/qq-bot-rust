@@ -251,6 +251,10 @@ export ZEROSTACK_BIN=/home/radxa/qq_bot/zerostack_wrap.sh,zerostack,/opt/llm-cli
 回退时打 WARN 日志（只记后端名，不记问题正文）。设计意图很清楚：
 **上游会死、会改名、会被更好的东西取代；死一个后端不该让机器人停止思考。**
 
+契约的完整定义（参数、退出码、超时、怎么接新后端、不该做什么）单独成文：
+[`docs/zerostack-adapter-contract.md`](docs/zerostack-adapter-contract.md) ——
+十年后接手的人（可能是你自己）只读那一页就能把新后端接上去。
+
 ## 预研结论（已验证的官方文档坑）
 
 - **`sign.html` 验签 DEMO 的 `sig` 是占位值**：官方公钥对 `timestamp+body` 验不过、
