@@ -117,7 +117,7 @@ pub fn mc_status(agent: &ureq::Agent, cfg: &McConfig) -> Result<String, String> 
     match crate::http_get_text(agent, &cfg.api_url) {
         Ok(body) => Ok(render_mc_status(&body)),
         Err(err) => Ok(format!(
-            "我的世界后台现在连不上（{}）。\n多半是控制台没启动：在 Radxa 上运行 radxa_console.py 后再查。",
+            "我的世界后台现在连不上（{}）。\n请检查 MINECRAFT_API_URL 指向的主机、端口和服务状态；无法确认该设备安装了什么控制台。",
             first_line(&err)
         )),
     }
@@ -344,7 +344,8 @@ mod tests {
         };
         let out = mc_status(&agent, &cfg).expect("unreachable must not be an Err");
         assert!(out.contains("连不上"), "hint missing: {out}");
-        assert!(out.contains("radxa_console"), "how-to-start missing: {out}");
+        assert!(out.contains("MINECRAFT_API_URL"), "configuration hint missing: {out}");
+        assert!(!out.contains("radxa_console.py"), "must not recommend an unverified script: {out}");
     }
 
     /// HTML 摘要：抽出标题并剥掉标签。
