@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn detects_group_image_attachments_without_download() {
-        let body = br#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"m","group_openid":"g","content":"帮我记录这个 bug","attachments":[{"content_type":"image/png","url":"https://example.invalid/a.png"}]}}"#;
+        let body = r#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"m","group_openid":"g","content":"帮我记录这个 bug","attachments":[{"content_type":"image/png","url":"https://example.invalid/a.png"}]}}"#.as_bytes();
         let ev = parse_message_event(body, MSG_GROUP_AT).unwrap();
         assert!(ev.has_attachments);
         assert_eq!(ev.content, "帮我记录这个 bug");
