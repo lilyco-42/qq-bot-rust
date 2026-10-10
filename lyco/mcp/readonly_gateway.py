@@ -56,7 +56,8 @@ def gh(args, timeout=12):
     if p.returncode:
         error = p.stderr.strip().splitlines()
         raise RuntimeError((error[0] if error else "GitHub CLI failed")[:260])
-    return p.stdout[:30000]
+    # Parse whole JSON first; clipping raw gh output corrupts long issue objects.
+    return p.stdout
 
 def clip(s, max_chars=MAX_OUTPUT):
     return s[:max_chars] + ("…[truncated]" if len(s) > max_chars else "")
