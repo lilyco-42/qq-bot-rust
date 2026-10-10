@@ -80,10 +80,10 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         ["bug记录", "BUG记录", "Bug记录", "bug反馈", "BUG反馈", "问题记录"]
             .iter().find_map(|prefix| input.strip_prefix(prefix))
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)
-                || rest.starts_with([':', '：']))
+                || rest.starts_with(':') || rest.starts_with('：'))
     };
     if let Some(rest) = normalize_bug(text) {
-        let details = rest.trim_start_matches([':', '：', ' ', '\t']).trim();
+        let details = rest.trim_start_matches(&[':', '：', ' ', '\t'][..]).trim();
         return Ok(if details.is_empty() {
             Reply::Text("用法：@lyco bug记录 <问题描述>（需真正 @ 机器人）".into())
         } else {
