@@ -70,3 +70,33 @@ On the always-on **QQ Bot device** (Radxa), install QuarkPan (e.g. into a dedica
 If the CLI returns success, the bot reports this outcome but asks you to verify the file in your drive. Login expiry, revoked links and capacity failures return a clear error. This code does **not** install QuarkPan, ask for a cookie in a QQ group, start any automatic scheduled task, or transfer any files until you configure the service and an administrator explicitly submits a share link. The bot works even when Windows is powered off.
 
 Only transfer content you are authorized to access and store. The tool is unofficial and its dependencies and Quark session credentials should be reviewed and kept isolated from other server services.
+
+
+## 群内 GitHub Issue 提单（Radxa / ZeroStack / gh）
+
+真正使用 QQ 的 @ 成员选中 `lyco` 机器人，然后在群里发送：
+
+```text
+@lyco /提单 绝境模拟隐身敌人技能释放动画正常但没有伤害，待复现
+@lyco bug记录 隐身怪会空放技能，主要是无伤害
+```
+
+仅 **管理员授权 QQ 用户 OpenID** 能执行。服务端必须设置
+`GH_WRITE=1`、`GH_REPO=lilyco-42/Stronghold-Protocol`、
+`GH_ALLOWED_OPENIDS=<author.member_openid>`（多个用逗号分隔）。
+`GH_TOKEN` 作为 QQ Bot **systemd 环境**内的机密变量提供；需要有目标仓库 Issue 写权限。
+这些值存入 `/home/radxa/qq_bot/env.sh`（仅 `radxa` 可读），禁止提交 GitHub。
+
+处理流程：QQ 校验签名 → 解析发送者 OpenID → 严格白名单 →
+ZeroStack (`--no-tools`) 把文本整理为待确认的描述 →
+`gh issue create --repo <固定仓库> --title ... --body ...` →
+QQ 回复真实 Issue URL。Issue 正文始终保留原始反馈，不接受模型产生的工具指令，
+模型不可直接执行 gh。AI 无响应时自动退化为原始反馈直接建单，确保不因模型失败丢单；
+`GH_ISSUE_AI=0` 可以禁用 AI 整理。
+
+未经授权回复权限不足，不执行 gh；`GH_WRITE` 默认为关闭；
+同一进程一次最多执行一个提单任务，超时受 gh/ZeroStack 配置限制。
+指令只处理从 QQ Webhook 实际送达的 `GROUP_AT_MESSAGE_CREATE` 事件。
+如果 QQ 没有下发群 @ 事件，再好的命令实现也不会被触发；排障时检查
+`server.log` 中 `event verified` 和 `POST /qq/webhook` 的时间。
+建议生产环境设置 `WEBHOOK_PRINT_EVENTS=0`，防止将 QQ 回调完整原文及附带认证元数据写入日志。
