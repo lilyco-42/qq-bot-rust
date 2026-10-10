@@ -40,3 +40,14 @@ A successful functional probe must show a real tool call rather than a
 text-only request pretending to call GitHub.
 
 The bot embeds the five core principles from the user-owned [lyco-skill](https://github.com/lilyco-42/lyco-skill) at pinned commit 2ca49373. Exact upstream SKILL.md is in lyco/skills/lyco/SKILL.md, tracked by SOURCE.md. Only the core philosophy is injected per QA turn; fixed trust boundaries remain separate. Updating the embedded copy requires review and a new build.
+
+## Stronghold source priority and community glossary
+For 卫戍协议 gameplay/盟约 questions, ZeroStack calls stronghold_wiki_lookup
+before generic search. The MCP only reads fixed PRTS game pages/sections.
+For community slang, the same tool adds a separate community_usage field,
+loaded from the maintained knowledge repository:
+https://github.com/lilyco-42/stronghold-knowledge .
+Source confidence must remain separate: PRTS mechanics are documentary
+evidence; QQ community opinions such as “不屈是区” are not balance facts.
+DeepWiki may help explain the fan project code but cannot supersede sources.
+The new tool is read-only; do not expose generic shell/HTTP/MCP write methods.
