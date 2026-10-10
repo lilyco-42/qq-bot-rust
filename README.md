@@ -26,3 +26,21 @@ Image processing failure yields an explicit diagnostic, not a fabricated OCR
 result. Images are transmitted to an external AI provider; avoid private
 screenshots unless this transfer is acceptable. Screenshot text is untrusted
 and never executed as instructions.
+
+
+## Persistent QQ group knowledge
+
+The /记 command or a direct message beginning with 记住 writes an important
+fact to the current group's Turso database. The /忆 command only reads
+and reinforces stored knowledge and never writes the message as a new fact.
+On subsequent questions such as 0.2.3版本更新了什么, the bot first searches
+saved version facts in the same group before calling the stateless AI model.
+The answer is labelled as group-provided and not independently verified.
+Generated AI answers never become authoritative facts.
+
+An administrator can import one fact at the next process startup by writing
+a UTF-8 file named .memory-import in the bot working directory. The first
+line is the QQ group's hexadecimal openid; all remaining lines contain the
+fact. On successful Turso write, the bot removes the import file. Do NOT
+commit group IDs or import files to this public repository. Alternatively
+set MEMORY_IMPORT_FILE to a file path controlled by the administrator.
