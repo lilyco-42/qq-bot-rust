@@ -27,16 +27,13 @@ pub fn extract_image_url(event: &[u8]) -> Option<String> {
             .get("content_type")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // QQ image URLs often have no file extension; the MIME metadata is only a hint.
-        let Ok(parsed) = Url::parse(url) else {
+        // QQ often sends signed, extensionless URLs without a content_type.
+        // CDN origin is the security boundary; image magic is checked after download.
+        // Do not reject real screenshots just because an optional hint is missing.
+        if content_type.starts_with("video/") || content_type.starts_with("audio/") {
             continue;
-        };
-        let suffix = parsed.path().to_ascii_lowercase();
-        let hinted = content_type.starts_with("image/")
-            || [".jpg", ".jpeg", ".png", ".webp", ".gif"]
-                .iter()
-                .any(|s| suffix.ends_with(s));
-        if hinted && is_trusted_image_url(url) {
+        }
+        if is_trusted_image_url(url) {
             return Some(url.to_string());
         }
     }
@@ -248,6 +245,15 @@ mod tests {
         );
         let unsafe_att = br#"{"d":{"attachments":[{"content_type":"image/png","url":"http://127.0.0.1/secret"}]}}"#;
         assert_eq!(extract_image_url(unsafe_att), None);
+        // Production QQ events can omit both extension and MIME.
+        let no_hint =
+            br#"{"d":{"attachments":[{"url":"https://multimedia.nt.qq.com/file?token=abc"}]}}"#;
+        assert_eq!(
+            extract_image_url(no_hint).as_deref(),
+            Some("https://multimedia.nt.qq.com/file?token=abc")
+        );
+        let non_image = br#"{"d":{"attachments":[{"content_type":"video/mp4","url":"https://gchat.qpic.cn/file"}]}}"#;
+        assert_eq!(extract_image_url(non_image), None);
     }
     #[test]
     fn image_magic_and_size_checked() {

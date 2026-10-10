@@ -70,30 +70,57 @@ pub fn gh_issue_search(cfg: &GhConfig, query: &str, limit: u32) -> Result<String
 ///
 /// Release 可能只发布 payload，不能把它当成全平台已可安装的客户端。
 pub fn gh_client_release(cfg: &GhConfig) -> Result<String, String> {
+    // GitHub's /releases/latest can point to a payload-only tag. List and
+    // select an actual published player build instead.
     let args = vec![
         "release".to_string(),
-        "view".to_string(),
+        "list".to_string(),
         "--repo".to_string(),
         "lilyco-42/StrongholdProtocolClient".to_string(),
+        "--limit".to_string(),
+        "50".to_string(),
         "--json".to_string(),
-        "tagName,publishedAt,url".to_string(),
+        "tagName,publishedAt,isDraft,isPrerelease".to_string(),
     ];
     let raw = crate::run_capture("gh", &args, cfg.timeout).map_err(gh_hint)?;
     render_client_release(&raw)
 }
 
-fn render_client_release(raw: &str) -> Result<String, String> {
-    let tag = json_scalar(raw, "tagName")
-        .ok_or_else(|| "GitHub 返回结果缺少 tagName，无法确认最新版本".to_string())?;
-    let url = json_scalar(raw, "url").unwrap_or_default();
-    let published = json_scalar(raw, "publishedAt").unwrap_or_else(|| "未知".to_string());
-    let note = if tag.starts_with("payload-") {
-        "注意：这是 Payload Release，不代表 Android/iOS 安装包已可下载。"
-    } else {
-        "安装包是否可用请查看 Release 的实际附件。"
+fn is_player_release_tag(tag: &str) -> bool {
+    let Some(version) = tag.strip_prefix('v') else {
+        return false;
     };
+    let Some((version, build)) = version.rsplit_once("-c") else {
+        return false;
+    };
+    build.len() > 0
+        && build.bytes().all(|b| b.is_ascii_digit())
+        && version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn render_client_release(raw: &str) -> Result<String, String> {
+    let data: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "GitHub Release 列表格式无效".to_string())?;
+    let list = data.as_array().ok_or("GitHub Release 列表不是数组")?;
+    let latest = list
+        .iter()
+        .filter(|entry| {
+            entry["isDraft"] == false
+                && entry["isPrerelease"] == false
+                && entry["tagName"].as_str().is_some_and(is_player_release_tag)
+        })
+        .max_by_key(|entry| entry["publishedAt"].as_str().unwrap_or(""));
+    let Some(entry) = latest else {
+        return Ok("未查到已发布的正式玩家客户端安装包；Payload/测试版不计入。请稍后查看 GitHub Releases。".into());
+    };
+    let tag = entry["tagName"].as_str().ok_or("缺少 tagName")?;
+    let published = entry["publishedAt"].as_str().unwrap_or("未知");
+    let url = format!("https://github.com/lilyco-42/StrongholdProtocolClient/releases/tag/{tag}");
     Ok(format!(
-        "StrongholdProtocolClient 最新 Release：{tag}\n发布时间（UTC）：{published}\n{note}\n来源：{url}"
+        "卫戍协议客户端正式版 {tag} 已发布。\n发布时间（UTC）：{published}\nAndroid APK、Windows、iOS 等下载请查看 Release 附件（iOS 未签名，Android 3D 尚待真机验收）。\n{url}"
     ))
 }
 
@@ -125,7 +152,9 @@ pub fn web_fetch(agent: &ureq::Agent, cfg: &WebConfig, url: &str) -> Result<Stri
         return Err("仅支持 http/https 地址".to_string());
     }
     if !cfg.allow_private && is_private_host(url) {
-        return Err("拒绝抓取内网地址（防 SSRF；确需放开请设 WEB_FETCH_ALLOW_PRIVATE=1）".to_string());
+        return Err(
+            "拒绝抓取内网地址（防 SSRF；确需放开请设 WEB_FETCH_ALLOW_PRIVATE=1）".to_string(),
+        );
     }
     let body = crate::http_get_text(agent, url)?;
     let summary = summarize_html(&body);
@@ -193,7 +222,11 @@ fn json_scalar(json: &str, key: &str) -> Option<String> {
         .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
         .unwrap_or(rest.len());
     let raw = rest[..end].trim();
-    if raw.is_empty() { None } else { Some(raw.to_string()) }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 /// 错误信息只取第一行：ureq 的错误常带多行上下文，灌进群里很吵。
@@ -375,17 +408,32 @@ mod tests {
         };
         let out = mc_status(&agent, &cfg).expect("unreachable must not be an Err");
         assert!(out.contains("连不上"), "hint missing: {out}");
-        assert!(out.contains("MINECRAFT_API_URL"), "configuration hint missing: {out}");
-        assert!(!out.contains("radxa_console.py"), "must not recommend an unverified script: {out}");
+        assert!(
+            out.contains("MINECRAFT_API_URL"),
+            "configuration hint missing: {out}"
+        );
+        assert!(
+            !out.contains("radxa_console.py"),
+            "must not recommend an unverified script: {out}"
+        );
     }
 
     #[test]
     fn client_release_distinguishes_payload_from_installer() {
-        let input = r#"{"tagName":"payload-v0.2.3-c33","publishedAt":"2026-10-10T06:09:18Z","url":"https://github.com/lilyco-42/StrongholdProtocolClient/releases/tag/payload-v0.2.3-c33"}"#;
+        // Payload-only latest release must never be mistaken for a player installer.
+        let input = r#"[
+          {"tagName":"payload-v0.2.3-c39","publishedAt":"2026-10-11T06:00:00Z","isDraft":false,"isPrerelease":false},
+          {"tagName":"v0.2.3-c38","publishedAt":"2026-10-10T16:58:00Z","isDraft":false,"isPrerelease":false},
+          {"tagName":"v0.2.3-c40","publishedAt":"2026-10-12T00:00:00Z","isDraft":true,"isPrerelease":false},
+          {"tagName":"v0.2.3-c37","publishedAt":"2026-10-09T00:00:00Z","isDraft":false,"isPrerelease":true}
+        ]"#;
         let out = super::render_client_release(input).unwrap();
-        assert!(out.contains("payload-v0.2.3-c33"));
-        assert!(out.contains("不代表 Android/iOS 安装包"));
-        assert!(out.contains("https://github.com/"));
+        assert!(out.contains("v0.2.3-c38"), "{out}");
+        assert!(!out.contains("payload-v0.2.3-c39"));
+        assert!(!out.contains("v0.2.3-c40"));
+        assert!(out.contains("/releases/tag/v0.2.3-c38"));
+        assert!(super::is_player_release_tag("v0.2.3-c38"));
+        assert!(!super::is_player_release_tag("payload-v0.2.3-c38"));
     }
 
     /// HTML 摘要：抽出标题并剥掉标签。
