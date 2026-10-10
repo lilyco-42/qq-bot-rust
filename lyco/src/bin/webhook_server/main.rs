@@ -33,6 +33,8 @@
 //! | `WEBHOOK_LOBBY` | `1` | 是否启用 `/房间` 组队大厅房间查询（`0` 关闭） |
 //! | `LOBBY_USER` | — | 大厅机器人专用账号（与 `LOBBY_PASS` 同时设置才启用） |
 //! | `LOBBY_PASS` | — | 大厅机器人专用密码（运行时注入，永不进日志） |
+//! | `SP_ROOM_API_URL` | `https://sp.lain42.top/api/bot/v1/rooms?limit=10` | /游戏房间 独立只读查询接口 |
+//! | `SP_ROOM_API_TOKEN` | — | /游戏房间 Bearer 密钥，仅运行时注入，不入日志 |
 //! | `MEMORY_DB` | `memory.db` | 记忆库（Turso）文件路径；需 `memory` feature |
 //! | `BOT_TOPIC` | `明日方舟卫戍协议` | 群默认话题（`/话题` 展示，并作为 AI 问答上下文前缀） |
 //! | `GH_REPO` | — | gh 目标仓库 `owner/repo`（`/issue` 检索、`/提单` 建单） |
@@ -58,6 +60,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod memory;
 #[cfg(feature = "tools")]
 mod tools;
+mod sp_rooms;
 #[cfg(feature = "vision")]
 mod vision;
 
@@ -194,6 +197,8 @@ enum ReplyBody {
     ServerStatus,
     /// 需要查询组队大厅房间列表（`/房间`），由接收端带 token 请求后成文。
     LobbyRooms,
+    /// Read-only Stronghold game rooms (not external group lobby).
+    StrongholdRooms,
     /// 需要写入记忆（`/记`）。
     Remember(String),
     /// 需要检索记忆（`/忆`；空关键词 = 概览）。
@@ -901,6 +906,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         CommandReply::Ask(question) => ReplyBody::Ask(question),
         CommandReply::ServerStatus => ReplyBody::ServerStatus,
         CommandReply::LobbyRooms => ReplyBody::LobbyRooms,
+        CommandReply::StrongholdRooms => ReplyBody::StrongholdRooms,
         // 记忆与资源调用：同样只声明意图，实际 IO（Turso / gh / HTTP）在执行阶段完成。
         CommandReply::Remember(content) => ReplyBody::Remember(content),
         CommandReply::Recall(keyword) => ReplyBody::Recall(keyword),
@@ -955,6 +961,12 @@ fn reply_worker(config: Config, body: Vec<u8>) {
         }
         ReplyBody::ServerStatus => server_status(&config, &label),
         ReplyBody::LobbyRooms => lobby_rooms(&config, &label),
+        ReplyBody::StrongholdRooms => {
+            let url = std::env::var("SP_ROOM_API_URL")
+                .unwrap_or_else(|_| "https://sp.lain42.top/api/bot/v1/rooms?limit=10".into());
+            let token = std::env::var("SP_ROOM_API_TOKEN").unwrap_or_default();
+            sp_rooms::query_rooms(&url, &token)
+        },
         ReplyBody::Remember(content) => remember_text(&config, content, &job.openid, &job.actor),
         ReplyBody::Recall(keyword) => recall_text(&config, keyword, &job.openid),
         ReplyBody::IssueSearch(query) => issue_search_text(&config, query, &job.openid),
@@ -2802,6 +2814,7 @@ mod tests {
             super::ReplyBody::Ask(question) => panic!("expected Text, got Ask({question})"),
             super::ReplyBody::ServerStatus => panic!("expected Text, got ServerStatus"),
             super::ReplyBody::LobbyRooms => panic!("expected Text, got LobbyRooms"),
+            super::ReplyBody::StrongholdRooms => panic!("expected Text, got StrongholdRooms"),
             super::ReplyBody::Remember(content) => {
                 panic!("expected Text, got Remember({content})")
             }
