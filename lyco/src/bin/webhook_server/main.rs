@@ -997,10 +997,17 @@ fn answer_question(
     let started = std::time::Instant::now();
     // 群默认话题作为上下文前缀注入：只影响送给模型的文本，
     // 沉淀进记忆的仍是用户原始问题（避免话题串污染检索）。
+    // 群聊普通问答使用 --no-tools，模型没有 gh/bash/浏览器/图片工具。
+    // 把实际能力边界逐次传给模型；避免模型虚构工具执行结果或时效性事实。
+    let capability_note = "能力边界：这是 QQ 群纯文本问答，不能读取图片附件、执行 bash/gh、\
+        浏览网页或查询实时版本。不得输出 invocation/tool_calls 等工具调用 JSON 冒充执行结果；\
+        如需 GitHub 最新版本，应明确表示未经核验并引导访问对应仓库 Release。\
+        收到图片 Bug 反馈时请让用户提供文字错误、复现步骤、系统和版本，不能声称看到了图片。\
+        对卫戍协议的活动日期、机制等未知事实不得编造。请用简短中文回答。";
     let asked = if config.topic.is_empty() {
-        question.to_string()
+        format!("{capability_note}\n群聊提问：{question}")
     } else {
-        format!("（当前群话题：{}）{}", config.topic, question)
+        format!("{capability_note}\n当前群话题：{}\n群聊提问：{question}", config.topic)
     };
     match ask_zerostack(config, &asked) {
         Ok(answer) => {
@@ -2045,7 +2052,23 @@ fn ask_one_backend(config: &Config, bin: &str, question: &str) -> Result<String,
     if answer.is_empty() {
         return Err("empty answer on stdout".to_string());
     }
+    // 不把模型生成的「调用工具」协议当成真实执行结果发进群。
+    if looks_like_tool_invocation(&answer) {
+        return Ok(String::from(
+            "当前群聊 AI 问答不能直接执行终端或 GitHub 命令。请用 /issue <关键词> 检索仓库问题，\
+             或用 /网站 <公开URL> 查看页面；最新版本以仓库 Release 为准。",
+        ));
+    }
     Ok(truncate_answer(&answer, config.qa.max_chars))
+}
+
+/// 仅检测明显的模型工具调用协议；普通 JSON 文本不应被拦截。
+fn looks_like_tool_invocation(answer: &str) -> bool {
+    let text = answer.trim_start();
+    (text.starts_with('{') || text.starts_with(char::from(96)))
+        && (text.contains("\"invocation\"")
+            || text.contains("\"tool_calls\"")
+            || (text.contains("\"tool\"") && text.contains("\"command\"")))
 }
 
 /// 启动子进程并在超时内收集 stdout；非零退出/超时/启动失败 → Err。
@@ -2917,6 +2940,18 @@ mod tests {
         let text = super::answer_question(&config(), "TEST", "任意问题", "scope", "actor");
         assert!(text.contains("AI 问答"), "text={text}");
         assert!(super::ask_zerostack(&config(), "q").is_err());
+    }
+
+    #[test]
+    fn rejects_phantom_tool_invocation_text() {
+        assert!(super::looks_like_tool_invocation(
+            r#"{"invocation":{"tool":"bash","command":"gh release view"}}"#
+        ));
+        assert!(super::looks_like_tool_invocation(
+            r#"{"tool_calls":[{"function":{"name":"bash"}}]}"#
+        ));
+        assert!(!super::looks_like_tool_invocation("我无法查询最新版本，建议查看 Release"));
+        assert!(!super::looks_like_tool_invocation("{\"version\":\"0.2.3\"}"));
     }
 
     #[test]
