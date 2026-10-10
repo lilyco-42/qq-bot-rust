@@ -2597,6 +2597,7 @@ mod tests {
             super::ReplyBody::WebFetch(url) => panic!("expected Text, got WebFetch({url})"),
             super::ReplyBody::Minecraft => panic!("expected Text, got Minecraft"),
             super::ReplyBody::Version => panic!("expected Text, got Version"),
+            super::ReplyBody::ClientRelease => panic!("expected Text, got ClientRelease"),
             super::ReplyBody::SelfCheck => panic!("expected Text, got SelfCheck"),
         }
     }
