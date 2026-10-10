@@ -70,6 +70,20 @@ class GatewayTest(TestCase):
         self.assertIn("打败最终领袖", d["guide_excerpt"])
         self.assertIn("prts.wiki", d["source_url"])
 
+    def test_physical_zone_is_not_community_insult(self):
+        for question in ("部署区是什么意思", "整备区是什么", "战斗区域"):
+            with self.subTest(question=question), patch.object(m,"fetch_public") as web:
+                self.assertIsNone(m._stronghold_community_note(question))
+                web.assert_not_called()
+
+    def test_tool_output_remains_valid_json_below_cap(self):
+        with patch.object(m,"_stronghold_section",
+                          side_effect=lambda title,sec: ("玩法说明文字。"*200) if sec=="6" else ""), patch.object(m,"fetch_public",
+                              return_value="区即蛆，是群聊主观差评"):
+            result=m.stronghold_wiki_lookup({"query":"区是什么意思"})
+        self.assertLess(len(result),m.MAX_OUTPUT)
+        self.assertTrue(__import__("json").loads(result)["community_usage"]["not_a_mechanic"])
+
     def test_stronghold_lookup_rejects_control_chars(self):
         with self.assertRaises(ValueError):
             m.stronghold_wiki_lookup({"query": "不屈" + chr(10) + "bad"})
