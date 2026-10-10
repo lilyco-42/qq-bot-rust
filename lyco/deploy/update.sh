@@ -38,7 +38,9 @@ HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
 KEEP_BACKUPS="${KEEP_BACKUPS:-3}"
 
 CHECK_ONLY=0
+SELF_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
+[ "${1:-}" = "--self" ] && SELF_ONLY=1
 
 # ── 日志 ────────────────────────────────────────────────────────────────
 log() {
@@ -121,6 +123,30 @@ remote_version() {
   esac
 }
 
+# ── 抓「更新脚本自身」这份资产（容错：老版本发布里没有，取不到不算失败） ──
+fetch_script_assets() {
+  local dest="$1" version="$2"
+  case "$UPDATE_SOURCE" in
+  github)
+    if command -v gh >/dev/null 2>&1; then
+      gh release download "$version" --repo "$UPDATE_REPO" \
+        --pattern "update.sh" --pattern "update.sh.sha256" \
+        --dir "$dest" --clobber >/dev/null 2>&1 || true
+    else
+      local auth=()
+      [ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+      local base="https://github.com/${UPDATE_REPO}/releases/download/${version}"
+      curl -fsSL --max-time "$UPDATE_TIMEOUT" "${auth[@]}" -o "${dest}/update.sh" "${base}/update.sh" 2>/dev/null || true
+      curl -fsSL --max-time "$UPDATE_TIMEOUT" "${auth[@]}" -o "${dest}/update.sh.sha256" "${base}/update.sh.sha256" 2>/dev/null || true
+    fi
+    ;;
+  static)
+    curl -fsSL --max-time "$UPDATE_TIMEOUT" -o "${dest}/update.sh" "${UPDATE_BASE_URL}/update.sh" 2>/dev/null || true
+    curl -fsSL --max-time "$UPDATE_TIMEOUT" -o "${dest}/update.sh.sha256" "${UPDATE_BASE_URL}/update.sh.sha256" 2>/dev/null || true
+    ;;
+  esac
+}
+
 # ── 下载资产到 $1 目录 ──────────────────────────────────────────────────
 download_assets() {
   local dest="$1" version="$2"
@@ -131,21 +157,58 @@ download_assets() {
       gh release download "$version" --repo "$UPDATE_REPO" \
         --pattern "$BIN_NAME" --pattern "$BIN_NAME.sha256" \
         --dir "$dest" --clobber >/dev/null || return 1
+      fetch_script_assets "$dest" "$version"
     else
       local auth=()
       [ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
       local base="https://github.com/${UPDATE_REPO}/releases/download/${version}"
       curl -fsSL --max-time "$UPDATE_TIMEOUT" "${auth[@]}" -o "${dest}/${BIN_NAME}" "${base}/${BIN_NAME}" || return 1
       curl -fsSL --max-time "$UPDATE_TIMEOUT" "${auth[@]}" -o "${dest}/${BIN_NAME}.sha256" "${base}/${BIN_NAME}.sha256" || return 1
+      fetch_script_assets "$dest" "$version"
     fi
     ;;
   static)
     curl -fsSL --max-time "$UPDATE_TIMEOUT" -o "${dest}/${BIN_NAME}" "${UPDATE_BASE_URL}/${BIN_NAME}" || return 1
     curl -fsSL --max-time "$UPDATE_TIMEOUT" -o "${dest}/${BIN_NAME}.sha256" "${UPDATE_BASE_URL}/${BIN_NAME}.sha256" || return 1
+    fetch_script_assets "$dest" "$version"
     ;;
   esac
   [ -s "${dest}/${BIN_NAME}" ] || return 1
   return 0
+}
+
+# ── 自更新：把 update.sh 自己也换掉（否则还得手工 scp 一次，就不叫无人维护了） ──
+#
+# 安全要点：**必须用「临时文件 + mv 原子改名」**，绝不能覆盖写。
+# 覆盖写会截断正在被 bash 逐行读取的脚本文件（bash 是流式解析的），
+# 可能让本轮执行读到半截文件而炸掉。mv 只是换名字，正在跑的进程仍持有旧 inode。
+# 另外：拿不到 .sha256 或语法检查不过，一律保留旧脚本（fail closed）。
+self_update() {
+  local dest="$1"
+  [ -s "${dest}/update.sh" ] || return 0 # 旧版发布没带这个资产 → 跳过（不算失败）
+  [ -s "${dest}/update.sh.sha256" ] || {
+    log "WARN 远端更新脚本没有校验文件，保留当前版本"
+    return 0
+  }
+  local expected actual
+  expected=$(awk '{print $1}' "${dest}/update.sh.sha256")
+  actual=$(sha256sum "${dest}/update.sh" | awk '{print $1}')
+  if [ "$expected" != "$actual" ]; then
+    log "WARN 远端 update.sh 校验不过（期望 ${expected}，实际 ${actual}），保留当前版本"
+    return 0
+  fi
+  if ! bash -n "${dest}/update.sh" 2>/dev/null; then
+    log "WARN 远端 update.sh 语法检查不过，保留当前版本"
+    return 0
+  fi
+  if cmp -s "${dest}/update.sh" "${APP_DIR}/update.sh"; then
+    return 0 # 内容一致，不动（也就不会每次都刷 mtime）
+  fi
+  cp -p "${APP_DIR}/update.sh" "${APP_DIR}/update.sh.prev" 2>/dev/null || true
+  cp "${dest}/update.sh" "${APP_DIR}/update.sh.new"
+  chmod 0755 "${APP_DIR}/update.sh.new"
+  mv -f "${APP_DIR}/update.sh.new" "${APP_DIR}/update.sh"
+  log "更新脚本已自替换（旧版留作 update.sh.prev，下一轮起生效）"
 }
 
 # ── 健康检查：必须「新版本真的在服务」才算成功 ──────────────────────────
@@ -223,6 +286,15 @@ if [ -z "$LATEST" ]; then
   exit 0
 fi
 
+if [ "$SELF_ONLY" = "1" ]; then
+  # 只换更新脚本本身（改脚本但不想等二进制发版时用）。
+  TMP_DIR=$(mktemp -d)
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  fetch_script_assets "$TMP_DIR" "$LATEST"
+  self_update "$TMP_DIR"
+  exit 0
+fi
+
 if [ "$CHECK_ONLY" = "1" ]; then
   log "本地=${CUR:-未知} 远端=${LATEST}（仅检查，未改动）"
   [ "$CUR" = "$LATEST" ] && exit 0 || exit 10
@@ -285,6 +357,8 @@ fi
 
 if wait_healthy "$LATEST"; then
   log "更新成功：${CUR:-未知} → ${LATEST}"
+  # 顺手把自己也换掉（下一轮生效）；失败不影响本次更新结果。
+  self_update "$TMP_DIR"
 else
   log "ERROR 新版本健康检查未通过（${LATEST}），开始回滚"
   rollback

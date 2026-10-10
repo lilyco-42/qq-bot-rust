@@ -65,15 +65,21 @@ jobs:
             --target aarch64-unknown-linux-musl \
             --features memory,tools
 
+      # 更新脚本也作为资产发布：Radxa 上那份 update.sh 会自替换（见 deploy/update.sh
+      # 的 self_update），所以脚本改动同样只需要推一个 tag，不必手工 scp。
       - name: Package assets
         run: |
           set -euo pipefail
+          bash -n deploy/update.sh
           cd target/aarch64-unknown-linux-musl/release
           test -x webhook_server
           sha256sum webhook_server > webhook_server.sha256
+          cp ../../../deploy/update.sh ./update.sh
+          chmod 0755 update.sh
+          sha256sum update.sh > update.sh.sha256
           echo "--- 产物 ---"
-          ls -l webhook_server webhook_server.sha256
-          cat webhook_server.sha256
+          ls -l webhook_server webhook_server.sha256 update.sh update.sh.sha256
+          cat webhook_server.sha256 update.sh.sha256
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -81,5 +87,7 @@ jobs:
           files: |
             lyco/target/aarch64-unknown-linux-musl/release/webhook_server
             lyco/target/aarch64-unknown-linux-musl/release/webhook_server.sha256
+            lyco/target/aarch64-unknown-linux-musl/release/update.sh
+            lyco/target/aarch64-unknown-linux-musl/release/update.sh.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
