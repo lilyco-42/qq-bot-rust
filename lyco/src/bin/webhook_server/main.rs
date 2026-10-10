@@ -460,6 +460,9 @@ fn run() -> Result<(), String> {
         match memory::Store::open(&path) {
             Ok(store) => {
                 logln("INFO", &format!("memory store opened: {path}"));
+                // 运维一次性导入文件（同一作用域的发布说明）；成功后移除，
+                // 不需要向 QQ 群注入伪造 webhook，也不用暴露数据库网络端口。
+                import_pending_fact(&store);
                 Some(Arc::new(store))
             }
             Err(err) => {
@@ -1046,6 +1049,38 @@ fn answer_question(
     #[cfg(not(feature = "memory"))]
     let _ = (scope, actor);
     let started = std::time::Instant::now();
+    // 群聊提问优先检索本群长期事实，避免 QA 模型凭空回答不清楚。
+    #[cfg(feature = "memory")]
+    if let Some(store) = &config.memory {
+        if let Some(version) = version_from_question(question) {
+            match store.recall_facts(scope, version, unix_now(), RECALL_LIMIT) {
+                Ok(facts) => {
+                    if let Some(fact) = facts
+                        .iter()
+                        .find(|item| {
+                            item.content.contains(version)
+                                && item.content.contains("更新")
+                                && item.content.chars().count() > 25
+                        })
+                        .or_else(|| facts.iter().find(|item| item.content.contains(version)))
+                    {
+                        logln(
+                            "INFO",
+                            &format!("qa fact memory hit event={label} version={version}"),
+                        );
+                        return truncate_answer(
+                            &format!(
+                                "根据本群已保存的说明（群成员提供，尚未独立核对）：{}",
+                                fact.content
+                            ),
+                            config.qa.max_chars,
+                        );
+                    }
+                }
+                Err(err) => logln("WARN", &format!("qa memory lookup failed: {err}")),
+            }
+        }
+    }
     // 群默认话题作为上下文前缀注入：只影响送给模型的文本，
     // 沉淀进记忆的仍是用户原始问题（避免话题串污染检索）。
     // 群聊普通问答使用 --no-tools，模型没有 gh/bash/浏览器/图片工具。
@@ -1103,6 +1138,101 @@ fn answer_question(
             String::from("AI 问答暂时不可用，请稍后再试")
         }
     }
+}
+
+/// 手动写入的管理员导入文件，第一行是 QQ 群作用域（非空 HEX），
+/// 其余是用户确认需要记住的正文。只接受本地文件系统中的预置内容。
+#[cfg(feature = "memory")]
+fn import_pending_fact(store: &memory::Store) {
+    let path =
+        std::env::var("MEMORY_IMPORT_FILE").unwrap_or_else(|_| String::from(".memory-import"));
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            logln("WARN", &format!("memory import read failed: {err}"));
+            return;
+        }
+    };
+    let Some((scope, fact)) = parse_import_fact(&contents) else {
+        logln("WARN", "memory import file invalid; preserving file");
+        return;
+    };
+    match store.remember(
+        memory::KIND_FACT,
+        scope,
+        fact,
+        "",
+        "operator-import",
+        3.0,
+        unix_now(),
+    ) {
+        Ok(_) => {
+            if let Err(err) = std::fs::remove_file(&path) {
+                logln(
+                    "WARN",
+                    &format!("memory import saved but file cleanup failed: {err}"),
+                );
+            } else {
+                logln(
+                    "INFO",
+                    "memory imported successfully and pending file removed",
+                );
+            }
+        }
+        Err(err) => logln("WARN", &format!("memory import write failed: {err}")),
+    }
+}
+
+#[cfg(feature = "memory")]
+fn parse_import_fact(input: &str) -> Option<(&str, &str)> {
+    let (scope, fact) = input.split_once('\n')?;
+    let scope = scope.trim();
+    let fact = fact.trim();
+    if !(6..=128).contains(&scope.len())
+        || !scope.bytes().all(|c| c.is_ascii_hexdigit())
+        || !(10..=1500).contains(&fact.chars().count())
+    {
+        return None;
+    }
+    Some((scope, fact))
+}
+
+/// 从自然语言问句中提取 0.2.3 / v0.2.3 形式的版本号。
+#[cfg(any(feature = "memory", test))]
+fn version_from_question(question: &str) -> Option<&str> {
+    let bytes = question.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() || (start > 0 && bytes[start - 1].is_ascii_digit()) {
+            start += 1;
+            continue;
+        }
+        let mut pos = start;
+        let mut ok = true;
+        for part in 0..3 {
+            let begin = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() && pos - begin < 4 {
+                pos += 1;
+            }
+            if pos == begin || (pos < bytes.len() && bytes[pos].is_ascii_digit()) {
+                ok = false;
+                break;
+            }
+            if part < 2 {
+                if bytes.get(pos) != Some(&b'.') {
+                    ok = false;
+                    break;
+                }
+                pos += 1;
+            }
+        }
+        if ok && (pos == bytes.len() || !bytes[pos].is_ascii_digit()) {
+            return question.get(start..pos);
+        }
+        start += 1;
+    }
+    None
 }
 
 /// `/记 <内容>`：把内容作为**重要事实**写入记忆库。
@@ -2705,6 +2835,28 @@ mod tests {
             }
             _ => panic!("expected multimodal image job"),
         }
+    }
+
+    #[cfg(feature = "memory")]
+    #[test]
+    fn parse_operator_memory_import_file() {
+        assert!(super::parse_import_fact("AABB112233\n0.2.3 版本更新加入了新干员").is_some());
+        assert!(super::parse_import_fact("not-a-group\n0.2.3 update notes").is_none());
+        assert!(super::parse_import_fact("ABCDEF01\n").is_none());
+    }
+
+    #[test]
+    fn version_memory_lookup_uses_question_version() {
+        assert_eq!(
+            super::version_from_question("0.2.3版本更新了什么"),
+            Some("0.2.3")
+        );
+        assert_eq!(
+            super::version_from_question("v0.2.3的更新内容?"),
+            Some("0.2.3")
+        );
+        assert_eq!(super::version_from_question("2026-10-10 没有版本"), None);
+        assert_eq!(super::version_from_question("你好"), None);
     }
 
     #[test]
