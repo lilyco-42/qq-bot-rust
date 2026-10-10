@@ -1,0 +1,33 @@
+name: qq-bot PR checks
+
+on:
+  pull_request:
+    paths:
+      - 'lyco/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: lyco
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lyco
+      - name: Test no_std core
+        run: cargo test --locked --lib
+      - name: Test QQ webhook with tools
+        run: cargo test --locked --bin webhook_server --features tools
+      - name: Test QQ webhook with memory and tools
+        run: cargo test --locked --bin webhook_server --features memory,tools
