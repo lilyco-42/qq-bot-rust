@@ -44,3 +44,12 @@ line is the QQ group's hexadecimal openid; all remaining lines contain the
 fact. On successful Turso write, the bot removes the import file. Do NOT
 commit group IDs or import files to this public repository. Alternatively
 set MEMORY_IMPORT_FILE to a file path controlled by the administrator.
+
+
+## Stronghold Protocol game room directory
+
+The new `/游戏房间` (aliases: `/卫戍房间`, `/sp房间`, `/gamerooms`) reads the actual Stronghold game waiting rooms; it is separate from `/房间`, which reads the online-platform lobby. The command is read-only and never joins a game.
+
+On Radxa, configure `SP_ROOM_API_URL=https://sp.lain42.top/api/bot/v1/rooms?limit=10` and `SP_ROOM_API_TOKEN` in the bot's private service environment. The Bearer token must not be committed, logged, sent to a chat, or injected into an LLM prompt. Missing configuration or a service outage returns an explicit message rather than invented rooms.
+
+The server adapter and protocol are in [lain42-stronghold-ops](https://github.com/lilyco-42/lain42-stronghold-ops/tree/main/extensions/sp-room-api). It requires authentication and only returns waiting-room codes, safe player display names, seat counts, difficulty and the optional AI-draft-order strategy. In-match selections and player credentials remain private. This adapter is opt-in at the Stronghold systemd layer and needs a planned game service restart before the endpoint becomes live.
