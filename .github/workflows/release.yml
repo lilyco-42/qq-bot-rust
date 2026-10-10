@@ -49,6 +49,8 @@ jobs:
 
       # 先跑测试：宁可不发版，也不要把坏二进制推给服务器（回滚虽然能兜住，
       # 但每次回滚都要人来看一眼 update.log）。
+      - name: Test read-only ZeroStack MCP gateway
+        run: python3 -m unittest discover -s mcp -p 'test_*.py'
       - name: Test (lib, no_std 核心)
         run: cargo test --locked --lib
 

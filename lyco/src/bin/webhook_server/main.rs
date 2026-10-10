@@ -263,6 +263,7 @@ struct QaConfig {
     provider: Option<String>,
     /// 覆盖 zerostack model（`--model`）；`None` 时用其 `config.toml`。
     model: Option<String>,
+    readonly_mcp: bool,
 }
 
 /// 服务器状态查询配置（`/对局`：`WEBHOOK_STATUS` / `SP_STATUS_URL` / `LOBBY_BASE_URL`）。
@@ -446,6 +447,7 @@ fn run() -> Result<(), String> {
         max_chars: qa_max_chars.clamp(50, 4_000),
         provider: qa_provider,
         model: qa_model,
+        readonly_mcp: std::env::var("QA_READONLY_MCP").ok().as_deref() == Some("1"),
     };
     // 服务器状态查询：默认开启；`WEBHOOK_STATUS=0` 关闭。地址可换成自建服。
     let status = StatusConfig {
@@ -1109,13 +1111,12 @@ fn answer_question(
     }
     // 群默认话题作为上下文前缀注入：只影响送给模型的文本，
     // 沉淀进记忆的仍是用户原始问题（避免话题串污染检索）。
-    // 群聊普通问答使用 --no-tools，模型没有 gh/bash/浏览器/图片工具。
-    // 把实际能力边界逐次传给模型；避免模型虚构工具执行结果或时效性事实。
-    let capability_note = "能力边界：这是 QQ 群纯文本问答，不能读取图片附件、执行 bash/gh、\
-        浏览网页或查询实时版本。不得输出 invocation/tool_calls 等工具调用 JSON 冒充执行结果；\
-        如需 GitHub 最新版本，应明确表示未经核验并引导访问对应仓库 Release。\
-        收到图片 Bug 反馈时请让用户提供文字错误、复现步骤、系统和版本，不能声称看到了图片。\
-        对卫戍协议的活动日期、机制等未知事实不得编造。请用简短中文回答。";
+    // ZeroStack selects named, read-only MCP operations. No arbitrary shell.
+    let capability_note = if config.qa.readonly_mcp {
+        "能力边界：你有 lyco 只读 MCP 工具，能自主查询 GitHub 上游/下游 Issue、客户端 Release、        公开网页和游戏健康状态。讨论 Bug 修复或最新版本时必须先查工具并附真实 Issue 链接与版本。        搜索无结果不等于已修复；不得虚构工具结果或图片内容。        不能执行 bash、改文件、建 Issue 或部署服务器。QQ 图片、记忆及管理员命令由 Rust 单独处理。简洁中文回复。"
+    } else {
+        "能力边界：这是 QQ 群纯文本问答，不能读取图片附件、执行 bash/gh、        浏览网页或查询实时版本。不得输出 invocation/tool_calls 等工具调用 JSON 冒充执行结果；        如需 GitHub 最新版本，应明确表示未经核验并引导访问对应仓库 Release。        收到图片 Bug 反馈时请让用户提供文字错误、复现步骤、系统和版本，不能声称看到了图片。        对卫戍协议的活动日期、机制等未知事实不得编造。请用简短中文回答。"
+    };
     let asked = if config.topic.is_empty() {
         format!("{capability_note}\n群聊提问：{question}")
     } else {
@@ -1430,7 +1431,7 @@ fn gh_actor_allowed(actor: &str, allowed: &str) -> bool {
 }
 
 /// 由 QQ 群事件验签结果中的发送者 ID 授权后建单。
-/// ZeroStack 只负责整理文字（--no-tools）；只有固定参数的 gh CLI 真正写仓库。
+/// Optional read-only ZeroStack MCP for lookup; GitHub writes remain Rust-admin gated.
 #[cfg(feature = "tools")]
 fn issue_create_text(config: &Config, original: &str, actor: &str, is_group: bool) -> String {
     if !is_group {
@@ -2326,12 +2327,25 @@ fn json_bool(object: &str, key: &str) -> Option<bool> {
 /// 等后端间切换，无需改 zerostack 的 `config.toml`（`None` 时沿用其默认）。
 fn qa_args(config: &Config, question: &str) -> Vec<String> {
     let mut args = vec![
-        "--no-tools".to_string(),
         "--no-context-files".to_string(),
         // 临时模式：不落会话文件（问答为一次性调用，避免数据目录无限增长）。
         "--no-session".to_string(),
         "--no-color".to_string(),
     ];
+    if config.qa.readonly_mcp {
+        // Expose only this MCP's named read methods. No generic bash or file tools.
+        args.extend([
+            // ZeroStack treats all MCP tools as writes in readonly mode; the
+            // exact --tools whitelist and our own MCP gateway enforce read-only.
+            "--dangerously-skip-permissions", "--no-hooks", "--max-agent-turns", "8",
+            "--custom-mcp",
+            "lyco=/usr/bin/python3 /home/radxa/qq_bot/readonly_gateway.py",
+            "--tools",
+            "github_search_issues,github_issue_detail,github_client_release,game_status,public_page",
+        ].iter().map(|s| s.to_string()));
+    } else {
+        args.insert(0, "--no-tools".to_string());
+    }
     if let Some(provider) = &config.qa.provider {
         args.push("--provider".to_string());
         args.push(provider.clone());
@@ -2385,7 +2399,12 @@ fn ask_zerostack(config: &Config, question: &str) -> Result<String, String> {
 /// 这份约定就是长期兼容层：只要新后端守住它，bot 一行都不用改。
 fn ask_one_backend(config: &Config, bin: &str, question: &str) -> Result<String, String> {
     let args = qa_args(config, question);
-    let raw = run_capture(bin, &args, config.qa.timeout)?;
+    let raw = if config.qa.readonly_mcp {
+        run_capture_with_xdg(bin, &args, config.qa.timeout,
+                             Some("/home/radxa/qq_bot/zs-readonly"))?
+    } else {
+        run_capture(bin, &args, config.qa.timeout)?
+    };
     let answer = clean_answer(&raw);
     if answer.is_empty() {
         return Err("empty answer on stdout".to_string());
@@ -2393,7 +2412,7 @@ fn ask_one_backend(config: &Config, bin: &str, question: &str) -> Result<String,
     // 不把模型生成的「调用工具」协议当成真实执行结果发进群。
     if looks_like_tool_invocation(&answer) {
         return Ok(String::from(
-            "当前群聊 AI 问答不能直接执行终端或 GitHub 命令。请用 /issue <关键词> 检索仓库问题，\
+            "模型输出了未真正执行的工具调用描述。本次答案不可采信，请重试或用 /issue <关键词> 检索，\
              或用 /网站 <公开URL> 查看页面；最新版本以仓库 Release 为准。",
         ));
     }
@@ -2413,13 +2432,20 @@ fn looks_like_tool_invocation(answer: &str) -> bool {
 ///
 /// stdout/stderr 由读取线程排空；超时 kill 后同样回收线程，不留孤儿。
 fn run_capture(bin: &str, args: &[String], timeout: Duration) -> Result<String, String> {
+    run_capture_with_xdg(bin, args, timeout, None)
+}
+
+/// Use an isolated ZeroStack configuration only for the named MCP allowlist.
+/// The normal bot/gh processes retain their existing configuration and permissions.
+fn run_capture_with_xdg(bin: &str, args: &[String], timeout: Duration, xdg: Option<&str>) -> Result<String, String> {
     use std::process::{Command, Stdio};
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut command = Command::new(bin);
+    command.args(args).stdin(Stdio::null())
+        .stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(path) = xdg {
+        command.env("XDG_CONFIG_HOME", path);
+    }
+    let mut child = command.spawn()
         .map_err(|err| format!("spawn {bin}: {err}"))?;
     let mut stdout = child
         .stdout
@@ -2716,6 +2742,7 @@ mod tests {
                 max_chars: 100,
                 provider: None,
                 model: None,
+                readonly_mcp: false,
             },
             // 状态查询默认关闭：单测不发网络请求。
             status: super::StatusConfig {
@@ -3344,6 +3371,23 @@ mod tests {
         assert!(!super::looks_like_tool_invocation(
             "{\"version\":\"0.2.3\"}"
         ));
+    }
+
+    #[test]
+    fn qa_mcp_only_allows_specific_readonly_tools() {
+        let mut config = config();
+        config.qa.readonly_mcp = true;
+        let args = super::qa_args(&config, "打铁 bug 修了吗");
+        let text = args.join(" ");
+        assert!(text.contains("--dangerously-skip-permissions"));
+        assert!(text.contains("--no-hooks"));
+        assert!(text.contains("--custom-mcp lyco=/usr/bin/python3"));
+        assert!(text.contains("github_search_issues"));
+        assert!(text.contains("github_issue_detail"));
+        assert!(!text.contains("--no-tools"));
+        assert!(!text.contains(" mcp__lyco__write"));
+        assert!(!text.contains("--accept-all"));
+        assert!(!text.contains("--tools bash"));
     }
 
     #[test]

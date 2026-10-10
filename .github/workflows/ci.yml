@@ -25,6 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: lyco
+      - name: Test ZeroStack MCP safety and GitHub query fixtures
+        run: python3 -m unittest discover -s mcp -p 'test_*.py'
       - name: Test no_std core
         run: cargo test --locked --lib
       - name: Test QQ webhook with tools
