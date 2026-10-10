@@ -104,7 +104,7 @@ fn has_nonempty_attachments(event_data: &[u8]) -> bool {
     let rest = rest[1..].iter().copied().skip_while(u8::is_ascii_whitespace).collect::<alloc::vec::Vec<_>>();
     if rest.first() != Some(&b'[') { return false; }
     let rest = rest[1..].iter().copied().skip_while(u8::is_ascii_whitespace).collect::<alloc::vec::Vec<_>>();
-    !matches!(rest.first(), None | Some(b']'))
+    rest.first().is_some_and(|byte| *byte != b']')
 }
 
 #[cfg(test)]
