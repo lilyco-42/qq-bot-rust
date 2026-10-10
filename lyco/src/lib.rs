@@ -13,7 +13,9 @@
 //!   3. **库内零 panic**：所有失败路径返回 [`error::Result`]，不 `unwrap`/`expect`/`panic!`；
 //!   4. **无数据竞争**：不设共享可变状态（如裸 `lastTraceID`），trace 标识随值传递；
 //!   5. **错误不吞**：解析/验签失败必须上抛，禁止"打日志继续跑"。
-#![cfg_attr(not(test), no_std)]
+// no_std 仅在「非测试 且 未启用 wtx 网关」时生效，保住核心的 no_std + alloc 承诺；
+// 启用 `gateway-wtx` 后需 tokio/std 运行时，整体转入 std 构建。
+#![cfg_attr(all(not(test), not(feature = "gateway-wtx")), no_std)]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -26,5 +28,9 @@ pub mod crypto;
 pub mod error;
 pub mod event;
 pub mod secret;
+
+// wtx WebSocket 网关传输层：feature 门控，未启用不影响 no_std 核心与既有测试。
+#[cfg(feature = "gateway-wtx")]
+pub mod gateway;
 
 pub use error::{Error, Result};

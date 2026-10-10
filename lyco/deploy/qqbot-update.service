@@ -1,0 +1,17 @@
+[Unit]
+Description=One-shot self-update for the QQ bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=radxa
+Group=radxa
+WorkingDirectory=/home/radxa/qq_bot
+
+# 更新脚本自己读 env.sh（含 GH_TOKEN）与可选 update.env。
+ExecStart=/home/radxa/qq_bot/update.sh
+
+# 更新失败不要拖垮后续调度：脚本自己会回滚并把原因写进 update.log。
+SuccessExitStatus=0
+TimeoutStartSec=300

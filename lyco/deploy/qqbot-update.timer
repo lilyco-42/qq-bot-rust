@@ -1,0 +1,18 @@
+[Unit]
+Description=Check for QQ bot updates every 10 minutes
+Documentation=file:///home/radxa/qq_bot/README.md
+
+[Timer]
+# 开机 2 分钟后先看一次（这时候往往刚重启过机器），之后每 10 分钟一次。
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+# 抖动：避免所有设备同一秒去戳 GitHub API。
+RandomizedDelaySec=60
+
+# 关机期间错过的检查，开机后补一次。
+Persistent=true
+Unit=qqbot-update.service
+
+[Install]
+WantedBy=timers.target

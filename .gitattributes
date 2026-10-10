@@ -1,0 +1,2 @@
+# 全部按 LF 存库：服务器是 Linux，CRLF 会让 shebang 失效。
+* text=auto eol=lf

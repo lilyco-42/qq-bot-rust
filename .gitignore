@@ -1,0 +1,11 @@
+# 本机一次性产物 / 临时脚本，不进仓库
+/package.json
+/package-lock.json
+/test_events*.sh
+/gen_events*.sh
+/lyco/test_events*.sh
+/lyco/gen_events*.sh
+/lyco/memory.db
+/lyco/memory.db-wal
+/lyco/memory.db-shm
+*.bak-*

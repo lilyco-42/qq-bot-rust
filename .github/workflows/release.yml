@@ -1,0 +1,85 @@
+name: release
+
+# 打 tag（v*）→ 交叉编译 aarch64-musl → 发布 Release 资产。
+# Radxa 上的 qqbot-update.timer 每 10 分钟来取一次，所以"发版"就是你本地
+# 推一个 tag 这么简单，服务器那边完全不用管。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 固定 nightly：wtx 依赖未稳定特性，而 nightly 会漂。
+  # 这个日期与本地验证通过的工具链一致（rustc 1.101.0-nightly c36f14571）。
+  # 要升级就单独开一次 PR 全量验证后改这里，别让它自由浮动。
+  RUSTUP_TOOLCHAIN: nightly-2026-10-01
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: lyco
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig（cargo-zigbuild 的交叉链接器）
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install Rust nightly + aarch64-musl target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lyco
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      # 先跑测试：宁可不发版，也不要把坏二进制推给服务器（回滚虽然能兜住，
+      # 但每次回滚都要人来看一眼 update.log）。
+      - name: Test (lib, no_std 核心)
+        run: cargo test --locked --lib
+
+      - name: Test (bin, tools)
+        run: cargo test --locked --bin webhook_server --features tools
+
+      - name: Build aarch64-unknown-linux-musl
+        env:
+          # 版本 = tag 名；/healthz 会把它报给自更新脚本比对。
+          QQBOT_VERSION: ${{ github.ref_name }}
+          QQBOT_BUILD_ID: ${{ github.sha }}
+        run: |
+          cargo zigbuild --locked --release \
+            --target aarch64-unknown-linux-musl \
+            --features memory,tools
+
+      - name: Package assets
+        run: |
+          set -euo pipefail
+          cd target/aarch64-unknown-linux-musl/release
+          test -x webhook_server
+          sha256sum webhook_server > webhook_server.sha256
+          echo "--- 产物 ---"
+          ls -l webhook_server webhook_server.sha256
+          cat webhook_server.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lyco/target/aarch64-unknown-linux-musl/release/webhook_server
+            lyco/target/aarch64-unknown-linux-musl/release/webhook_server.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

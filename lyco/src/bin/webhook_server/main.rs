@@ -33,6 +33,12 @@
 //! | `WEBHOOK_LOBBY` | `1` | 是否启用 `/房间` 组队大厅房间查询（`0` 关闭） |
 //! | `LOBBY_USER` | — | 大厅机器人专用账号（与 `LOBBY_PASS` 同时设置才启用） |
 //! | `LOBBY_PASS` | — | 大厅机器人专用密码（运行时注入，永不进日志） |
+//! | `MEMORY_DB` | `memory.db` | 记忆库（Turso）文件路径；需 `memory` feature |
+//! | `BOT_TOPIC` | `明日方舟卫戍协议` | 群默认话题（`/话题` 展示，并作为 AI 问答上下文前缀） |
+//! | `GH_REPO` | — | gh 目标仓库 `owner/repo`（`/issue` 检索、`/提单` 建单） |
+//! | `GH_WRITE` | `0` | 是否允许 gh **写**操作（`/提单`；默认关闭防滥用） |
+//! | `WEB_FETCH_ALLOW_PRIVATE` | `0` | `/网站` 是否允许抓取内网地址（防 SSRF，默认否） |
+//! | `MINECRAFT_API_URL` | — | 我的世界后台地址（`/mc`；未设置时明确提示未配置） |
 
 use qq_bot_rust::api;
 use qq_bot_rust::callback::{self, OP_CHALLENGE, OP_EVENT};
@@ -45,6 +51,13 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// 记忆层与资源调用层：feature 门控（Turso 为 std + async，仅接收端使用；
+// 不启用时整棵依赖树不参与编译，核心库保持 no_std + alloc）。
+#[cfg(feature = "memory")]
+mod memory;
+#[cfg(feature = "tools")]
+mod tools;
 
 /// 请求头缓冲上限（QQ 回调头远小于此值）。
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -64,6 +77,40 @@ const HEADER_SIG_TIMESTAMP: &str = "X-Signature-Timestamp";
 
 /// token 缓存刷新提前量（官方：过期前 60s 内获取会签发新 token）。
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
+
+/// 群内问答沉淀为 issue 记忆时的基础重要度（普通问题，半衰期约 7 天）。
+#[cfg(feature = "memory")]
+const ISSUE_IMPORTANCE: f64 = 1.0;
+/// `/记` 显式记下的重要事实的基础重要度（半衰期约 28 天，明显更难遗忘）。
+#[cfg(feature = "memory")]
+const FACT_IMPORTANCE: f64 = 2.0;
+/// `/忆` 与 `/issue` 单次召回条数上限（群消息不宜过长）。
+#[cfg(feature = "memory")]
+const RECALL_LIMIT: usize = 5;
+/// gh issue 搜索条数上限。
+#[cfg(feature = "tools")]
+const GH_ISSUE_LIMIT: u32 = 5;
+
+/// 构建版本：CI 用 tag 注入 `QQBOT_VERSION`（如 `v1.2.3`），本地构建回落 crate 版本。
+///
+/// 自更新脚本靠 `/healthz` 里的这个字符串判断「要不要换版本」，
+/// 因此它是**部署契约**的一部分：改格式等于改协议。
+const VERSION: &str = match option_env!("QQBOT_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// Windows 路径分隔符：`probe_bin` 用它区分「这是路径」还是「命令名」。
+const WIN_SEP: char = '\\';
+
+/// 构建标识（CI 注入 commit sha / 时间戳）；本地构建为空串。
+const BUILD_ID: &str = match option_env!("QQBOT_BUILD_ID") {
+    Some(id) => id,
+    None => "",
+};
+
+/// 进程启动时刻（unix 秒）：`/版本` 与 `/自检` 报告运行时长用。
+static STARTED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// 服务配置（每连接克隆一份；token 缓存经 `Arc<Mutex<..>>` 共享）。
 #[derive(Clone)]
@@ -86,6 +133,20 @@ struct Config {
     lobby: LobbyConfig,
     /// 大厅登录会话缓存（access/refresh token；锁内仅指针级存取，网络 I/O 不持锁）。
     lobby_session: Arc<Mutex<Option<LobbySession>>>,
+    /// 记忆库（Turso 持久化）；`None` = 未启用 memory feature 或打开失败（能力降级，不致命）。
+    #[cfg(feature = "memory")]
+    memory: Option<Arc<memory::Store>>,
+    /// 群默认话题（`BOT_TOPIC`）：`/话题` 展示，并作为 AI 问答的上下文前缀。
+    topic: String,
+    /// gh 调用配置（`/issue` 搜仓库 issue；写操作受 `GH_WRITE` 单独控制）。
+    #[cfg(feature = "tools")]
+    gh: tools::GhConfig,
+    /// 网页抓取配置（`/网站`）。
+    #[cfg(feature = "tools")]
+    web: tools::WebConfig,
+    /// 我的世界后台配置（`/mc`）。
+    #[cfg(feature = "tools")]
+    mc: tools::McConfig,
 }
 
 /// 缓存的 AppAccessToken 及其绝对过期时刻（unix 秒）。
@@ -115,6 +176,8 @@ struct ReplyJob {
     msg_id: String,
     /// 事件类型（日志标签）。
     event_type: String,
+    /// 提问者 openid：记忆的「谁问过」维度（群消息为发言者，非群本身）。
+    actor: String,
     /// 回复内容（指令文本，或待 AI 问答的问题）。
     body: ReplyBody,
 }
@@ -129,6 +192,24 @@ enum ReplyBody {
     ServerStatus,
     /// 需要查询组队大厅房间列表（`/房间`），由接收端带 token 请求后成文。
     LobbyRooms,
+    /// 需要写入记忆（`/记`）。
+    Remember(String),
+    /// 需要检索记忆（`/忆`；空关键词 = 概览）。
+    Recall(String),
+    /// 需要查「是否有人问过同类问题」（`/issue`）：本地记忆 + gh。
+    IssueSearch(String),
+    /// 需要创建一条 issue（`/提单`，写操作，受 `GH_WRITE` 限制）。
+    IssueCreate(String),
+    /// 需要展示群默认话题（`/话题`）。
+    Topic,
+    /// 需要抓取网页（`/网站 <url>`）。
+    WebFetch(String),
+    /// 需要查询我的世界后台（`/mc`）。
+    Minecraft,
+    /// 需要展示构建版本与运行时长（`/版本`）。
+    Version,
+    /// 需要对各接缝做体检（`/自检`）：记忆库 / gh / 问答后端 / 网页 / MC。
+    SelfCheck,
 }
 
 impl ReplyJob {
@@ -144,8 +225,12 @@ impl ReplyJob {
 struct QaConfig {
     /// 是否启用问答（`WEBHOOK_QA=0` 关闭）。
     enabled: bool,
-    /// zerostack 可执行文件（空串等价于关闭）。
-    bin: String,
+    /// 问答后端候选链（`ZEROSTACK_BIN` 逗号分隔，按序取第一个成功的）。
+    ///
+    /// 这是 bot 与「模型生态」之间**唯一**的可换件（见 [`ask_zerostack`]）：
+    /// 任何后端只要满足「可执行 + `-p <问题>` + 回答打到 stdout」即可直接顶上来，
+    /// 上游换代（改名/换实现/换厂商）只改环境变量，不改代码。空链 = 关闭问答。
+    bins: Vec<String>,
     /// 单次问答超时（超时杀进程，回复显式兜底文案）。
     timeout: Duration,
     /// 回答截断上限（字数；平台无公开上限，保守截断）。
@@ -269,6 +354,17 @@ enum ReadError {
 }
 
 fn main() -> std::process::ExitCode {
+    // `--version` 必须在读任何密钥之前处理：自更新脚本第一步就是问版本，
+    // 那时不该要求 QQ_BOT_SECRET 存在（否则脚本得先注入全部凭证）。
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "--version" || arg == "-V" || arg == "version" {
+            println!("qq_bot_rust {VERSION}");
+            if !BUILD_ID.is_empty() {
+                println!("build {BUILD_ID}");
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+    }
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -279,6 +375,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), String> {
+    STARTED_AT.store(unix_now(), std::sync::atomic::Ordering::Relaxed);
     let secret_value =
         std::env::var("QQ_BOT_SECRET").map_err(|_| "QQ_BOT_SECRET 环境变量未设置")?;
     if secret_value.is_empty() {
@@ -294,7 +391,13 @@ fn run() -> Result<(), String> {
     let qa_enabled = std::env::var("WEBHOOK_QA")
         .map(|value| value != "0")
         .unwrap_or(true);
-    let qa_bin = std::env::var("ZEROSTACK_BIN").unwrap_or_else(|_| "zerostack".to_string());
+    // 候选链：逗号分隔，前一个失败自动退到后一个（上游 CLI 换代时不必改部署）。
+    let qa_bins: Vec<String> = std::env::var("ZEROSTACK_BIN")
+        .unwrap_or_else(|_| "zerostack".to_string())
+        .split(',')
+        .map(|candidate| candidate.trim().to_string())
+        .filter(|candidate| !candidate.is_empty())
+        .collect();
     let qa_timeout_secs = std::env::var("QA_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -313,8 +416,8 @@ fn run() -> Result<(), String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let qa = QaConfig {
-        enabled: qa_enabled && !qa_bin.is_empty(),
-        bin: qa_bin,
+        enabled: qa_enabled && !qa_bins.is_empty(),
+        bins: qa_bins,
         timeout: Duration::from_secs(qa_timeout_secs.clamp(5, 600)),
         max_chars: qa_max_chars.clamp(50, 4_000),
         provider: qa_provider,
@@ -342,6 +445,56 @@ fn run() -> Result<(), String> {
         user: lobby_user,
         pass: SecretString::new(lobby_pass),
     };
+    // 记忆库（Turso）：路径可配（MEMORY_DB，默认当前目录下 memory.db）。
+    // 打开失败不致命——记 WARN 并降级为「无记忆」，其余能力照常可用。
+    #[cfg(feature = "memory")]
+    let memory_store = {
+        let path = std::env::var("MEMORY_DB").unwrap_or_else(|_| "memory.db".to_string());
+        match memory::Store::open(&path) {
+            Ok(store) => {
+                logln("INFO", &format!("memory store opened: {path}"));
+                Some(Arc::new(store))
+            }
+            Err(err) => {
+                logln("WARN", &format!("memory store unavailable ({path}): {err}"));
+                None
+            }
+        }
+    };
+    // 启动时做一次遗忘清理：剔除已衰减到阈值以下的琐碎记忆（人类式遗忘落地）。
+    #[cfg(feature = "memory")]
+    if let Some(store) = &memory_store {
+        match store.forget(unix_now()) {
+            Ok(0) => {}
+            Ok(count) => logln("INFO", &format!("memory forgotten {count} stale entries")),
+            Err(err) => logln("WARN", &format!("memory forget failed: {err}")),
+        }
+    }
+    // 群默认话题：既用于 `/话题` 展示，也作为 AI 问答的上下文前缀。
+    // 需求指定群里默认聊「明日方舟卫戍协议」，故作为内置默认值。
+    let topic = std::env::var("BOT_TOPIC")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|_| String::from("明日方舟卫戍协议"));
+    // 资源调用配置：未配置地址时对应命令给出明确提示，不影响启动。
+    #[cfg(feature = "tools")]
+    let gh = tools::GhConfig {
+        repo: std::env::var("GH_REPO").unwrap_or_default(),
+        write_enabled: std::env::var("GH_WRITE")
+            .map(|value| value == "1")
+            .unwrap_or(false),
+        timeout: Duration::from_secs(20),
+    };
+    #[cfg(feature = "tools")]
+    let web = tools::WebConfig {
+        allow_private: std::env::var("WEB_FETCH_ALLOW_PRIVATE")
+            .map(|value| value == "1")
+            .unwrap_or(false),
+        max_chars: 800,
+    };
+    #[cfg(feature = "tools")]
+    let mc = tools::McConfig {
+        api_url: std::env::var("MINECRAFT_API_URL").unwrap_or_default(),
+    };
     let config = Config {
         secret: SecretString::new(secret_value),
         print_events: std::env::var("WEBHOOK_PRINT_EVENTS")
@@ -359,6 +512,15 @@ fn run() -> Result<(), String> {
         status,
         lobby,
         lobby_session: Arc::new(Mutex::new(None)),
+        #[cfg(feature = "memory")]
+        memory: memory_store,
+        topic,
+        #[cfg(feature = "tools")]
+        gh,
+        #[cfg(feature = "tools")]
+        web,
+        #[cfg(feature = "tools")]
+        mc,
     };
     let bind = std::env::var("WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
@@ -377,10 +539,18 @@ fn run() -> Result<(), String> {
     // 公钥非机密：启动时打印，供与开放平台控制台展示的公钥比对。
     let pubkey = derive_public_key(config.secret.expose())
         .map_err(|err| format!("派生机器人公钥失败: {err}"))?;
+    #[cfg(feature = "memory")]
+    let memory_state = if config.memory.is_some() { "on" } else { "off" };
+    #[cfg(not(feature = "memory"))]
+    let memory_state = "off";
+    #[cfg(feature = "tools")]
+    let tools_state = "on";
+    #[cfg(not(feature = "tools"))]
+    let tools_state = "off";
     logln(
         "INFO",
         &format!(
-            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={} qa={} status={} lobby={}",
+            "webhook server listening on {local} appid={} pubkey={} print_events={} reply={} qa={} status={} lobby={} memory={} tools={} topic={}",
             config.app_id.as_deref().unwrap_or("-"),
             hex_encode(&pubkey),
             config.print_events,
@@ -388,6 +558,9 @@ fn run() -> Result<(), String> {
             if config.qa.enabled { "on" } else { "off" },
             if config.status.enabled { "on" } else { "off" },
             if config.lobby.enabled { "on" } else { "off" },
+            memory_state,
+            tools_state,
+            config.topic,
         ),
     );
 
@@ -538,7 +711,13 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ReadError> {
 fn process(config: &Config, request: &HttpRequest) -> Reply {
     let method = request.method.as_str();
     if method.eq_ignore_ascii_case("GET") && (request.path == "/healthz" || request.path == "/") {
-        return Reply::text(200, "OK", "ok\n".to_string());
+        // 纯文本、一行一字段：探活与自更新脚本都读这里。
+        // 加字段只能往后追加——`update.sh` 靠 `version=` 判定要不要换版本。
+        return Reply::text(
+            200,
+            "OK",
+            format!("ok\nversion={VERSION}\nbuild={BUILD_ID}\n"),
+        );
     }
     if method.eq_ignore_ascii_case("HEAD") {
         return Reply::text(200, "OK", String::new());
@@ -680,6 +859,16 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         CommandReply::Ask(question) => ReplyBody::Ask(question),
         CommandReply::ServerStatus => ReplyBody::ServerStatus,
         CommandReply::LobbyRooms => ReplyBody::LobbyRooms,
+        // 记忆与资源调用：同样只声明意图，实际 IO（Turso / gh / HTTP）在执行阶段完成。
+        CommandReply::Remember(content) => ReplyBody::Remember(content),
+        CommandReply::Recall(keyword) => ReplyBody::Recall(keyword),
+        CommandReply::IssueSearch(query) => ReplyBody::IssueSearch(query),
+        CommandReply::IssueCreate(title) => ReplyBody::IssueCreate(title),
+        CommandReply::Topic => ReplyBody::Topic,
+        CommandReply::WebFetch(url) => ReplyBody::WebFetch(url),
+        CommandReply::Minecraft => ReplyBody::Minecraft,
+        CommandReply::Version => ReplyBody::Version,
+        CommandReply::SelfCheck => ReplyBody::SelfCheck,
         CommandReply::Skip => return Ok(None),
     };
     Ok(Some(ReplyJob {
@@ -687,6 +876,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         openid,
         msg_id: parsed.msg_id,
         event_type: parsed.event_type,
+        actor: parsed.user_openid.clone().unwrap_or_default(),
         body: reply_body,
     }))
 }
@@ -716,10 +906,34 @@ fn reply_worker(config: Config, body: Vec<u8>) {
     // 不吞错——错误已记日志）。Text：直接用指令回复。
     let text = match &job.body {
         ReplyBody::Text(text) => text.clone(),
-        ReplyBody::Ask(question) => answer_question(&config, &label, question),
+        // Ask 顺带完成「群内问答 → issue 记忆」的自动沉淀（见 answer_question）。
+        ReplyBody::Ask(question) => {
+            answer_question(&config, &label, question, &job.openid, &job.actor)
+        }
         ReplyBody::ServerStatus => server_status(&config, &label),
         ReplyBody::LobbyRooms => lobby_rooms(&config, &label),
+        ReplyBody::Remember(content) => remember_text(&config, content, &job.openid, &job.actor),
+        ReplyBody::Recall(keyword) => recall_text(&config, keyword, &job.openid),
+        ReplyBody::IssueSearch(query) => issue_search_text(&config, query, &job.openid),
+        ReplyBody::IssueCreate(title) => issue_create_text(&config, title),
+        ReplyBody::Topic => topic_text(&config),
+        ReplyBody::WebFetch(url) => web_fetch_text(&config, url),
+        ReplyBody::Minecraft => mc_status_text(&config),
+        ReplyBody::Version => version_text(&config),
+        ReplyBody::SelfCheck => self_check_text(&config),
     };
+    // 观测：回复正文只在 print_events 打开时落日志（默认与事件打印同开关）。
+    // 测试群不存在时发QQ必然失败，没有这条日志就只能靠猜指令输出是否正确。
+    if config.print_events {
+        logln(
+            "REPLY",
+            &format!(
+                "event={label} target={} text={}",
+                job.target_label(),
+                sanitize_text(text.as_bytes(), 400)
+            ),
+        );
+    }
     let outcome = match send_reply(&config, &job, &text, false) {
         Ok(reply_id) => Ok(reply_id),
         // 401 = 凭证失效/过期：强刷 token 后有界重试一次（绝不循环）。
@@ -769,9 +983,26 @@ fn send_reply(
 ///
 /// 失败（未启用/启动失败/超时/非零退出/空回答）→ 记 WARN 并返回显式兜底
 /// 文案：错误不吞（日志留痕），机器人不装死（用户得到明确回应）。
-fn answer_question(config: &Config, label: &str, question: &str) -> String {
+fn answer_question(
+    config: &Config,
+    label: &str,
+    question: &str,
+    scope: &str,
+    actor: &str,
+) -> String {
+    // 未启用记忆时 scope/actor 无处使用：显式吞掉，避免把参数改成 cfg 条件编译
+    // （签名随 feature 漂移会让调用方跟着裂）。
+    #[cfg(not(feature = "memory"))]
+    let _ = (scope, actor);
     let started = std::time::Instant::now();
-    match ask_zerostack(config, question) {
+    // 群默认话题作为上下文前缀注入：只影响送给模型的文本，
+    // 沉淀进记忆的仍是用户原始问题（避免话题串污染检索）。
+    let asked = if config.topic.is_empty() {
+        question.to_string()
+    } else {
+        format!("（当前群话题：{}）{}", config.topic, question)
+    };
+    match ask_zerostack(config, &asked) {
         Ok(answer) => {
             logln(
                 "INFO",
@@ -782,6 +1013,22 @@ fn answer_question(config: &Config, label: &str, question: &str) -> String {
                     started.elapsed().as_millis(),
                 ),
             );
+            // 自动沉淀：群内一问一答 → issue 记忆。
+            // 失败只记 WARN，绝不影响已经拿到的回答。
+            #[cfg(feature = "memory")]
+            if let Some(store) = &config.memory {
+                if let Err(err) = store.remember(
+                    memory::KIND_ISSUE,
+                    scope,
+                    question,
+                    &answer,
+                    actor,
+                    ISSUE_IMPORTANCE,
+                    unix_now(),
+                ) {
+                    logln("WARN", &format!("memory remember failed event={label}: {err}"));
+                }
+            }
             answer
         }
         Err(err) => {
@@ -792,6 +1039,373 @@ fn answer_question(config: &Config, label: &str, question: &str) -> String {
             String::from("AI 问答暂时不可用，请稍后再试")
         }
     }
+}
+
+/// `/记 <内容>`：把内容作为**重要事实**写入记忆库。
+///
+/// 重要事实用较高的基础重要度 → 半衰期明显更长，不会像闲聊那样隔夜就忘。
+/// 同一条内容重复记入时不会新增条目，而是「频次 +1、强度回补」（越提越牢）。
+// feature 关闭时入参无消费方（降级路径直接返回文案）：显式允许，不改签名。
+#[cfg_attr(not(all(feature = "memory", feature = "tools")), allow(unused_variables))]
+fn remember_text(config: &Config, content: &str, scope: &str, actor: &str) -> String {
+    #[cfg(feature = "memory")]
+    {
+        if let Some(store) = &config.memory {
+            return match store.remember(
+                memory::KIND_FACT,
+                scope,
+                content,
+                "",
+                actor,
+                FACT_IMPORTANCE,
+                unix_now(),
+            ) {
+                Ok((created, freq)) => {
+                    let preview = truncate_answer(content, 120);
+                    if created {
+                        format!("记住了：{preview}")
+                    } else {
+                        format!("这条我记过（第 {freq} 次提到），印象更深了：{preview}")
+                    }
+                }
+                Err(err) => {
+                    logln("WARN", &format!("memory remember failed: {err}"));
+                    String::from("记忆库写入失败，请稍后再试")
+                }
+            };
+        }
+    }
+    String::from("记忆功能不可用（需以 memory feature 构建，或记忆库打开失败）")
+}
+
+/// `/忆 [关键词]`：检索记忆；不带关键词时给出「记得最牢的若干条」概览。
+///
+/// 命中本身会强化记忆（被想起 → 记得更牢），这与人类回忆一致。
+// feature 关闭时入参无消费方（降级路径直接返回文案）：显式允许，不改签名。
+#[cfg_attr(not(all(feature = "memory", feature = "tools")), allow(unused_variables))]
+fn recall_text(config: &Config, keyword: &str, scope: &str) -> String {
+    #[cfg(feature = "memory")]
+    {
+        if let Some(store) = &config.memory {
+            let now = unix_now();
+            return match store.recall(scope, keyword, "", now, RECALL_LIMIT) {
+                Ok(items) if items.is_empty() => {
+                    if keyword.is_empty() {
+                        String::from("我还没有记住任何东西（试试 /记 <内容>）")
+                    } else {
+                        format!("没有找到与「{keyword}」相关的记忆")
+                    }
+                }
+                Ok(items) => {
+                    let mut lines = Vec::new();
+                    for item in &items {
+                        let preview = truncate_answer(&item.content, 60);
+                        // 分类 + 记忆年龄：让人一眼看出「这是问答还是事实、记了多久」。
+                        let kind = match item.kind.as_str() {
+                            memory::KIND_ISSUE => "问答",
+                            memory::KIND_FACT => "事实",
+                            memory::KIND_TOPIC => "话题",
+                            _ => "笔记",
+                        };
+                        let age_days = ((now - item.created_at) / 86_400).max(0);
+                        let age = if age_days == 0 {
+                            String::from("今天")
+                        } else {
+                            format!("{age_days} 天前")
+                        };
+                        if item.answer.is_empty() {
+                            lines.push(format!(
+                                "· [{kind}] {preview}（想起 {} 次，{age}）",
+                                item.freq
+                            ));
+                        } else {
+                            let answer = truncate_answer(&item.answer, 60);
+                            lines.push(format!(
+                                "· [{kind}] {preview} → {answer}（想起 {} 次，{age}）",
+                                item.freq
+                            ));
+                        }
+                    }
+                    // 概览（不带关键词）时附上总量，让人知道「记住了多少」。
+                    let header = if keyword.is_empty() {
+                        match store.stats() {
+                            Ok((total, _kinds)) => format!("我记得这些（共 {total} 条）："),
+                            Err(_) => String::from("我记得这些："),
+                        }
+                    } else {
+                        format!("关于「{keyword}」，我记得：")
+                    };
+                    format!("{header}\n{}", lines.join("\n"))
+                }
+                Err(err) => {
+                    logln("WARN", &format!("memory recall failed: {err}"));
+                    String::from("记忆检索失败，请稍后再试")
+                }
+            };
+        }
+    }
+    String::from("记忆功能不可用（需以 memory feature 构建，或记忆库打开失败）")
+}
+
+/// `/issue <关键词>`：先查本地记忆（谁问过、问过几次），再用 gh 搜仓库 issue。
+///
+/// 两路都失败才有意义地报错；任一成功即给出该路结果（不因一路失败而全盘报错）。
+// feature 关闭时入参无消费方（降级路径直接返回文案）：显式允许，不改签名。
+#[cfg_attr(not(all(feature = "memory", feature = "tools")), allow(unused_variables))]
+fn issue_search_text(config: &Config, query: &str, scope: &str) -> String {
+    // 关掉 tools 时这一路不推内容，`mut` 无消费方。
+    #[cfg_attr(not(feature = "tools"), allow(unused_mut))]
+    let mut parts: Vec<String> = Vec::new();
+    #[cfg(feature = "memory")]
+    {
+        if let Some(store) = &config.memory {
+            match store.recall(scope, query, "", unix_now(), RECALL_LIMIT) {
+                Ok(items) if !items.is_empty() => {
+                    let mut lines = Vec::new();
+                    for item in &items {
+                        let who = if item.actor.is_empty() {
+                            String::from("有人")
+                        } else {
+                            item.actor.chars().take(6).collect::<String>()
+                        };
+                        let preview = truncate_answer(&item.content, 60);
+                        lines.push(format!("· {who}… 问过 {} 次：{preview}", item.freq));
+                    }
+                    parts.push(format!("本地记忆：\n{}", lines.join("\n")));
+                }
+                Ok(_) => parts.push(String::from("本地记忆：没有相同问题。")),
+                Err(err) => logln("WARN", &format!("issue recall failed: {err}")),
+            }
+        }
+    }
+    #[cfg(feature = "tools")]
+    {
+        match tools::gh_issue_search(&config.gh, query, GH_ISSUE_LIMIT) {
+            Ok(text) => parts.push(format!("仓库 issue：\n{}", truncate_answer(&text, 600))),
+            Err(err) => parts.push(format!("仓库 issue：{err}")),
+        }
+    }
+    if parts.is_empty() {
+        return String::from("issue 检索不可用（需 memory 或 tools feature）");
+    }
+    truncate_answer(&parts.join("\n\n"), 900)
+}
+
+/// `/提单 <标题>`：在仓库建一条 issue（写操作，默认关闭，需 `GH_WRITE=1`）。
+#[cfg(feature = "tools")]
+fn issue_create_text(config: &Config, title: &str) -> String {
+    let body = format!("由 QQ 群机器人记录：{title}");
+    match tools::gh_issue_create(&config.gh, title, &body) {
+        Ok(text) => truncate_answer(&text, 400),
+        Err(err) => format!("建单失败：{err}"),
+    }
+}
+
+#[cfg(not(feature = "tools"))]
+fn issue_create_text(_config: &Config, _title: &str) -> String {
+    String::from("建单未启用（需以 tools feature 构建）")
+}
+
+/// `/话题`：展示当前群默认话题（同时它也作为 AI 问答的上下文前缀）。
+/// `/版本`：构建版本 + 运行时长 + 各接缝开关（排障第一眼看的就这几项）。
+fn version_text(config: &Config) -> String {
+    let mut lines = vec![
+        format!("qq_bot_rust {VERSION}"),
+        format!("运行时长：{}", uptime_text()),
+    ];
+    if !BUILD_ID.is_empty() {
+        lines.push(format!("构建：{BUILD_ID}"));
+    }
+    let backends = if config.qa.bins.is_empty() {
+        String::from("未配置")
+    } else {
+        config.qa.bins.join(" → ")
+    };
+    lines.push(format!("问答后端：{backends}"));
+    lines.push(format!(
+        "记忆库：{}",
+        if memory_ready(config) { "已启用" } else { "未启用" }
+    ));
+    lines.push(format!(
+        "话题：{}",
+        if config.topic.is_empty() { "未设置" } else { &config.topic }
+    ));
+    lines.join("\n")
+}
+
+/// `/自检`：逐条接缝体检，告诉你「哪条通了、哪条为什么不通」。
+///
+/// 硬约束：**永远返回一段文本**（永不 Err、永不 panic）。机器人「不回话」
+/// 本身就是最难查的故障，所以体检本身不能再变成一个新的静默失败点。
+fn self_check_text(config: &Config) -> String {
+    let mut lines = vec![format!("自检 {VERSION}（已运行 {}）", uptime_text())];
+
+    // 1) 记忆库
+    #[cfg(feature = "memory")]
+    match &config.memory {
+        Some(store) => match store.stats() {
+            Ok((total, kinds)) => {
+                let detail = if kinds.is_empty() {
+                    String::from("暂无分类")
+                } else {
+                    kinds
+                        .iter()
+                        .map(|(kind, count)| format!("{kind} {count}"))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                };
+                lines.push(format!("记忆库：ok（共 {total} 条｜{detail}）"));
+            }
+            Err(err) => lines.push(format!("记忆库：查询失败（{err}）")),
+        },
+        None => lines.push(String::from("记忆库：未启用（DB 打开失败或 memory feature 关闭）")),
+    };
+    #[cfg(not(feature = "memory"))]
+    lines.push(String::from("记忆库：本二进制未编译 memory feature"));
+
+    // 2) 问答后端候选链（只探可用性，不真的发一次问答——体检不能花钱）
+    if !config.qa.enabled {
+        lines.push(String::from("问答后端：已关闭（WEBHOOK_QA=0 或候选链为空）"));
+    } else {
+        for bin in &config.qa.bins {
+            match probe_bin(bin) {
+                Ok(path) => lines.push(format!("问答后端 {bin}：ok（{path}）")),
+                Err(reason) => lines.push(format!("问答后端 {bin}：不可用（{reason}）")),
+            }
+        }
+    }
+
+    // 3) 资源调用各接缝
+    #[cfg(feature = "tools")]
+    {
+        match crate::run_capture("gh", &[String::from("--version")], Duration::from_secs(5)) {
+            Ok(out) => lines.push(format!("gh：ok（{}）", tools::first_line(&out))),
+            Err(err) => lines.push(format!("gh：不可用（{}）", tools::first_line(&err))),
+        }
+        lines.push(format!(
+            "gh 仓库：{}",
+            if config.gh.repo.is_empty() { "未配置" } else { &config.gh.repo }
+        ));
+        lines.push(format!(
+            "我的世界后台：{}",
+            if config.mc.api_url.is_empty() { "未配置" } else { &config.mc.api_url }
+        ));
+        lines.push(format!(
+            "网页抓取：{}（上限 {} 字）",
+            if config.web.allow_private { "允许内网" } else { "仅公网" },
+            config.web.max_chars
+        ));
+    }
+    #[cfg(not(feature = "tools"))]
+    lines.push(String::from("资源调用：本二进制未编译 tools feature"));
+
+    lines.join("\n")
+}
+
+/// 运行时长的人类可读描述（`/版本`、`/自检` 共用）。
+fn uptime_text() -> String {
+    let started = STARTED_AT.load(std::sync::atomic::Ordering::Relaxed);
+    if started <= 0 {
+        return String::from("未知");
+    }
+    let secs = unix_now().saturating_sub(started).max(0);
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else if secs < 3_600 {
+        format!("{} 分钟", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} 小时", secs / 3_600)
+    } else {
+        format!("{} 天", secs / 86_400)
+    }
+}
+
+/// 记忆库是否真的可用（编译开关 + 运行时是否成功打开，两者都满足才算）。
+#[cfg(feature = "memory")]
+fn memory_ready(config: &Config) -> bool {
+    config.memory.is_some()
+}
+
+/// 记忆库是否真的可用（未编译 memory feature 时恒为 false）。
+#[cfg(not(feature = "memory"))]
+fn memory_ready(_config: &Config) -> bool {
+    false
+}
+
+/// 探查候选后端是否「存在且可执行」——不发起真实问答（体检不该产生费用/延迟）。
+///
+/// `bin` 含路径分隔符就按路径查，否则按 `PATH` 逐目录查（与 shell 一致）。
+fn probe_bin(bin: &str) -> Result<String, String> {
+    if bin.is_empty() {
+        return Err(String::from("候选为空"));
+    }
+    let candidates: Vec<std::path::PathBuf> = if bin.contains('/') || bin.contains(WIN_SEP) {
+        vec![std::path::PathBuf::from(bin)]
+    } else {
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(bin))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if candidates.is_empty() {
+        return Err(String::from("PATH 为空，无法定位"));
+    }
+    for path in candidates {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return Err(format!("{} 没有可执行位", path.display()));
+            }
+        }
+        return Ok(path.display().to_string());
+    }
+    Err(format!("找不到可执行文件 {bin}"))
+}
+
+fn topic_text(config: &Config) -> String {
+    if config.topic.is_empty() {
+        String::from("当前未设置群默认话题（设 BOT_TOPIC 可指定）")
+    } else {
+        format!("本群默认话题：{}", config.topic)
+    }
+}
+
+/// `/网站 <url>`：抓取网页正文（去标签 + 截断）。
+#[cfg(feature = "tools")]
+fn web_fetch_text(config: &Config, url: &str) -> String {
+    match tools::web_fetch(&config.agent, &config.web, url) {
+        Ok(text) => truncate_answer(&text, config.web.max_chars),
+        Err(err) => format!("抓取失败：{err}"),
+    }
+}
+
+#[cfg(not(feature = "tools"))]
+fn web_fetch_text(_config: &Config, _url: &str) -> String {
+    String::from("网页抓取未启用（需以 tools feature 构建）")
+}
+
+/// `/mc`：查询我的世界服务器后台（未配置时明确告知，不假装成功）。
+#[cfg(feature = "tools")]
+fn mc_status_text(config: &Config) -> String {
+    match tools::mc_status(&config.agent, &config.mc) {
+        Ok(text) => text,
+        Err(err) => format!("我的世界后台：{err}"),
+    }
+}
+
+#[cfg(not(feature = "tools"))]
+fn mc_status_text(_config: &Config) -> String {
+    String::from("我的世界后台未启用（需以 tools feature 构建）")
 }
 
 /// 服务器状态：只读查询游戏 `/healthz` 与大厅公开计数，成文返回。
@@ -1399,8 +2013,34 @@ fn ask_zerostack(config: &Config, question: &str) -> Result<String, String> {
     if !config.qa.enabled {
         return Err("qa disabled".to_string());
     }
+    if config.qa.bins.is_empty() {
+        return Err("问答后端候选链为空（ZEROSTACK_BIN 未配置）".to_string());
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for bin in &config.qa.bins {
+        match ask_one_backend(config, bin, question) {
+            Ok(answer) => {
+                if !failures.is_empty() {
+                    // 主后端失效、由后备顶上：留痕（不泄露问题正文），但不打扰用户。
+                    logln(
+                        "WARN",
+                        &format!("qa backend fell back to {bin}; earlier: {}", failures.join("; ")),
+                    );
+                }
+                return Ok(answer);
+            }
+            Err(err) => failures.push(format!("{bin}: {err}")),
+        }
+    }
+    Err(format!("所有问答后端都失败 → {}", failures.join(" | ")))
+}
+
+/// 用**一个**后端跑一次单轮问答：约定 `-p <问题>` 进、回答出 stdout。
+///
+/// 这份约定就是长期兼容层：只要新后端守住它，bot 一行都不用改。
+fn ask_one_backend(config: &Config, bin: &str, question: &str) -> Result<String, String> {
     let args = qa_args(config, question);
-    let raw = run_capture(&config.qa.bin, &args, config.qa.timeout)?;
+    let raw = run_capture(bin, &args, config.qa.timeout)?;
     let answer = clean_answer(&raw);
     if answer.is_empty() {
         return Err("empty answer on stdout".to_string());
@@ -1710,7 +2350,7 @@ mod tests {
             // 问答默认关闭：单测不 spawn 进程。
             qa: super::QaConfig {
                 enabled: false,
-                bin: String::new(),
+                bins: Vec::new(),
                 timeout: std::time::Duration::from_secs(1),
                 max_chars: 100,
                 provider: None,
@@ -1729,6 +2369,25 @@ mod tests {
                 pass: SecretString::new(String::new()),
             },
             lobby_session: Arc::new(Mutex::new(None)),
+            // 记忆库默认不挂载：单测不落盘。
+            #[cfg(feature = "memory")]
+            memory: None,
+            topic: String::new(),
+            #[cfg(feature = "tools")]
+            gh: super::tools::GhConfig {
+                repo: String::new(),
+                write_enabled: false,
+                timeout: std::time::Duration::from_secs(1),
+            },
+            #[cfg(feature = "tools")]
+            web: super::tools::WebConfig {
+                allow_private: false,
+                max_chars: 100,
+            },
+            #[cfg(feature = "tools")]
+            mc: super::tools::McConfig {
+                api_url: String::new(),
+            },
         }
     }
 
@@ -1752,7 +2411,8 @@ mod tests {
     fn health_endpoint_answers_200() {
         let reply = process(&config(), &request("GET", "/healthz", None, b""));
         assert_eq!(reply.status, 200);
-        assert_eq!(reply.body, "ok\n");
+        assert!(reply.body.starts_with("ok\n"), "body={}", reply.body);
+        assert!(reply.body.contains("\nversion="), "body={}", reply.body);
     }
 
     #[test]
@@ -1882,6 +2542,21 @@ mod tests {
             super::ReplyBody::Ask(question) => panic!("expected Text, got Ask({question})"),
             super::ReplyBody::ServerStatus => panic!("expected Text, got ServerStatus"),
             super::ReplyBody::LobbyRooms => panic!("expected Text, got LobbyRooms"),
+            super::ReplyBody::Remember(content) => {
+                panic!("expected Text, got Remember({content})")
+            }
+            super::ReplyBody::Recall(keyword) => panic!("expected Text, got Recall({keyword})"),
+            super::ReplyBody::IssueSearch(query) => {
+                panic!("expected Text, got IssueSearch({query})")
+            }
+            super::ReplyBody::IssueCreate(title) => {
+                panic!("expected Text, got IssueCreate({title})")
+            }
+            super::ReplyBody::Topic => panic!("expected Text, got Topic"),
+            super::ReplyBody::WebFetch(url) => panic!("expected Text, got WebFetch({url})"),
+            super::ReplyBody::Minecraft => panic!("expected Text, got Minecraft"),
+            super::ReplyBody::Version => panic!("expected Text, got Version"),
+            super::ReplyBody::SelfCheck => panic!("expected Text, got SelfCheck"),
         }
     }
 
@@ -2239,7 +2914,7 @@ mod tests {
     #[test]
     fn answer_question_disabled_returns_fallback() {
         // 问答未启用（单测配置）→ 显式兜底文案，不 spawn 进程。
-        let text = super::answer_question(&config(), "TEST", "任意问题");
+        let text = super::answer_question(&config(), "TEST", "任意问题", "scope", "actor");
         assert!(text.contains("AI 问答"), "text={text}");
         assert!(super::ask_zerostack(&config(), "q").is_err());
     }
@@ -2265,6 +2940,45 @@ mod tests {
                 "你好",
             ]
         );
+    }
+
+    /// `/版本`：版本号、后端候选链、话题都要露面（排障第一眼的信息）。
+    #[test]
+    fn version_text_reports_build_and_backends() {
+        let mut config = config();
+        config.qa.bins = vec!["zerostack".to_string(), "/opt/alt-llm".to_string()];
+        config.topic = "明日方舟卫戍协议".to_string();
+        let text = super::version_text(&config);
+        assert!(text.contains(super::VERSION), "version missing: {text}");
+        assert!(
+            text.contains("zerostack → /opt/alt-llm"),
+            "chain missing: {text}"
+        );
+        assert!(text.contains("明日方舟卫戍协议"), "topic missing: {text}");
+    }
+
+    /// `/自检` 是「永不失败」的：所有接缝都没配也必须给出一段文本，
+    /// 否则「机器人不回话」这个故障本身就没法被查出来。
+    #[test]
+    fn self_check_always_answers_and_lists_seams() {
+        let mut config = config();
+        config.qa.enabled = false;
+        let text = super::self_check_text(&config);
+        assert!(text.starts_with("自检"), "text={text}");
+        assert!(text.contains("已运行"), "text={text}");
+        assert!(text.contains("问答后端：已关闭"), "text={text}");
+        assert!(text.contains("记忆库："), "text={text}");
+    }
+
+    /// 后端二进制不存在时必须点出「不可用」+ 原因，而不是静默跳过。
+    #[test]
+    fn self_check_reports_missing_backend_binary() {
+        let mut config = config();
+        config.qa.enabled = true;
+        config.qa.bins = vec!["/nonexistent/zerostack-xyz".to_string()];
+        let text = super::self_check_text(&config);
+        assert!(text.contains("不可用"), "text={text}");
+        assert!(text.contains("zerostack-xyz"), "text={text}");
     }
 
     #[test]

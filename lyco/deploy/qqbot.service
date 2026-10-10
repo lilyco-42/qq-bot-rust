@@ -1,0 +1,36 @@
+[Unit]
+Description=QQ bot webhook server (qq_bot_rust)
+Documentation=file:///home/radxa/qq_bot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+WorkingDirectory=/home/radxa/qq_bot
+
+# 全部凭证与开关都在这里（chmod 600，不入库、不进日志）。
+EnvironmentFile=/home/radxa/qq_bot/env.sh
+
+ExecStart=/home/radxa/qq_bot/webhook_server
+ExecReload=/bin/kill -HUP $MAINPID
+
+# 崩了就自己起来 —— 无人值守的基本盘。
+Restart=always
+RestartSec=3
+
+# 崩溃风暴保护：60 秒内超 5 次就放弃重启并留下 failed 状态，
+# 免得把 QQ 开放接口刷成风控对象。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=append:/home/radxa/qq_bot/server.log
+StandardError=append:/home/radxa/qq_bot/server.log
+
+# 加固：不需要额外权限，也不需要写 /tmp 之外的系统路径。
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

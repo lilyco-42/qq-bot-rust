@@ -8,7 +8,8 @@ categories = ["api-bindings", "no-std", "network-programming"]
 
 [dependencies]
 # wtx 生态（no_std + alloc，传输/HTTP/TLS/WebSocket 按 feature 渐进启用）。
-# 注意：wtx 需要 nightly（#![feature(random, return_type_notation)]），见 rust-toolchain.toml。
+# 选用锁定的 0.52.1（crates.io），不追 main 分支；wtx 在该版本下以 stable 即可编译
+# （依赖的 nightly feature 仅用于 `from_std_random`，本库改用 `getrandom` 后端规避）。
 wtx = { version = "0.52.1", default-features = false }
 # Ed25519（webhook 回调验签/握手签名）；与 wtx crypto-ruco 后端同源，后续并轨。
 ed25519-dalek = { version = "3", default-features = false }
@@ -22,5 +23,46 @@ httparse = { version = "1.0", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 # wtx 的 HTTP/传输层能力在后续里程碑接入，此前允许"依赖未被引用"告警。
+
+# 异步运行时（gateway-wtx 传输层 / memory 的 Turso 客户端需要）。
+tokio = { version = "1", optional = true, default-features = false, features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+# Turso —— SQLite 的 Rust 重写（纯 Rust，无 C 依赖；与 aarch64-musl 静态交叉编译零摩擦）。
+# 仅接收端 bin 的「记忆/issue 沉淀」使用；核心库保持 no_std，不引用。
+#
+# default-features = false 是刻意的：默认集含 `fts`（全文检索）与 `mimalloc`，
+# 其中 fts 模块在当前 nightly 下编译失败（自定义 allocator 类型不匹配），
+# 而记忆检索走 LIKE + 自研评分，不需要 FTS；去掉两者同时为静态二进制瘦身。
+turso = { version = "0.8.2", default-features = false, optional = true }
+
+[features]
+default = []
+# wtx 生态 WebSocket 网关传输层：no_std WebSocket + TLS(CCADB 根证书) + tokio 执行器。
+# 启用后整库以 std 构建（tokio 所需），核心协议层仍可独立以 no_std 编译。
+gateway-wtx = [
+  "dep:tokio",
+  "wtx/std",
+  "wtx/web-socket",
+  "wtx/tls",
+  "wtx/crypto-ring",
+  "wtx/ccadb",
+  "wtx/getrandom",
+  "wtx/tokio",
+]
+# 记忆/issue 沉淀：SQLite 兼容的 Turso 本地库（人类式遗忘曲线 + 频次强化）。
+# 启用后接收端 bin 获得持久化记忆；核心库仍保持 no_std + alloc，不引用 turso。
+memory = ["dep:turso", "dep:tokio"]
+# 资源调用层：gh cli / 网页抓取 / Minecraft 后台（无新增依赖，复用 ureq）。
+tools = []
+
 [lints.cargo]
 unused_dependencies = "allow"
+
+[[example]]
+name = "gateway_wtx"
+path = "examples/gateway_wtx.rs"
+required-features = ["gateway-wtx"]
+
+[[example]]
+name = "turso_smoke"
+path = "examples/turso_smoke.rs"
+required-features = ["memory"]

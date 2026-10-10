@@ -28,6 +28,30 @@ pub enum Reply {
     /// 与 [`Reply::ServerStatus`] 同一模式：分发层无 IO，只声明意图；
     /// 实际请求（需机器人专用账号登录）在接收端完成。
     LobbyRooms,
+    /// 需要「记住」的内容（`/记`）：由调用方写入记忆库（重要事实，重要度高）。
+    Remember(String),
+    /// 需要「回忆」的关键词（`/忆`）：由调用方检索记忆库。
+    ///
+    /// 空串表示不带关键词——回忆该作用域下最重要的若干条（概览）。
+    Recall(String),
+    /// 需要查询「是否有人问过同类问题」（`/issue`）：由调用方先查本地记忆，
+    /// 再用 gh cli 搜仓库 issue，两者合并成文。
+    IssueSearch(String),
+    /// 需要创建一条 issue（`/提单 <标题>`）：**写操作**，是否放行由接收端的
+    /// `GH_WRITE` 决定（默认关闭，避免群成员随意在仓库建单）。
+    IssueCreate(String),
+    /// 需要展示当前群默认话题（`/话题`）。
+    Topic,
+    /// 需要抓取网页正文（`/网站 <url>`）。
+    WebFetch(String),
+    /// 需要查询我的世界服务器后台（`/mc`）。
+    Minecraft,
+    /// 需要展示构建版本与运行时长（`/版本`）。
+    Version,
+    /// 需要逐条接缝体检（`/自检`）：记忆库 / 问答后端 / gh / 网页 / MC。
+    ///
+    /// 与其它意图同样只声明：真正的探测在接收端（无 IO 是这一层的契约）。
+    SelfCheck,
     /// 不需要回复（如空内容、无法构成回复的输入）。
     Skip,
 }
@@ -63,6 +87,22 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "对局" | "状态" | "服务器" | "status" | "server" => Reply::ServerStatus,
         // 组队大厅房间列表（等待中的房间）：需机器人专用账号，请求在接收端完成。
         "房间" | "组队" | "大厅" | "rooms" | "lobby" => Reply::LobbyRooms,
+        // 记忆：写入/检索持久化记忆库（接收端完成；未启用 memory 时给出提示）。
+        "记" | "记住" | "remember" => remember_reply(rest),
+        // 回忆：空关键词 = 概览（该作用域下最重要的若干条），故不判空。
+        "忆" | "回忆" | "recall" => Reply::Recall(rest.to_string()),
+        // 同类 issue 检索：本地记忆 + gh cli 搜仓库，接收端合并成文。
+        "issue" | "问题" | "问过" | "issues" => issue_reply(rest),
+        // 建 issue（写操作）：意图同样只声明，能否执行由接收端 GH_WRITE 决定。
+        "提单" | "建单" | "newissue" => issue_create_reply(rest),
+        // 群默认话题。
+        "话题" | "topic" => Reply::Topic,
+        // 网页抓取与我的世界后台（资源调用；接收端完成，未配置时明确提示）。
+        "网站" | "web" | "抓" => web_reply(rest),
+        "mc" | "我的世界" | "minecraft" => Reply::Minecraft,
+        // 运维自省：版本与体检（排障入口，不要求群成员懂服务器）。
+        "版本" | "version" => Reply::Version,
+        "自检" | "体检" | "健康" | "selfcheck" | "health" => Reply::SelfCheck,
         _ => Reply::Text(String::from("未识别指令。发送「/帮助」查看可用指令")),
     };
     Ok(reply)
@@ -78,6 +118,15 @@ fn help_text() -> String {
          /复读 <文本> — 原样返回（≤140 字）\n\
          /对局 — 服务器对局/等待状态\n\
          /房间 — 组队大厅等待中的房间\n\
+         /记 <内容> — 记下重要信息（会强化、不易忘）\n\
+         /忆 [关键词] — 回忆（不带词=重要记忆概览）\n\
+         /issue <关键词> — 查是否有人问过（记忆+仓库 issue）\n\
+         /提单 <标题> — 在仓库建一条 issue（需开启 GH_WRITE）\n\
+         /话题 — 当前群默认话题\n\
+         /网站 <url> — 抓取网页正文\n\
+         /mc — 我的世界服务器状态\n\
+         /版本 — 构建版本与运行时长\n\
+         /自检 — 各接缝体检（记忆/问答/gh/网页/MC）\n\
          /关于 — 版本信息\n\
          直接发文字可向 AI 提问",
     )
@@ -140,6 +189,46 @@ fn echo_reply(arg: &str) -> String {
         return String::from("用法：复读 <文本>");
     }
     arg.chars().take(140).collect()
+}
+
+/// `/记`：缺参数给用法，否则声明「写入记忆」意图（内容保守截断）。
+fn remember_reply(arg: &str) -> Reply {
+    if arg.is_empty() {
+        return Reply::Text(String::from("用法：/记 <要记住的内容>"));
+    }
+    Reply::Remember(arg.chars().take(500).collect())
+}
+
+/// `/issue`：缺参数给用法，否则声明「同类 issue 检索」意图。
+fn issue_reply(arg: &str) -> Reply {
+    if arg.is_empty() {
+        return Reply::Text(String::from(
+            "用法：/issue <关键词> — 查是否有人问过（本地记忆 + 仓库 issue）",
+        ));
+    }
+    Reply::IssueSearch(arg.chars().take(200).collect())
+}
+
+/// `/提单`：缺参数给用法，否则声明「创建 issue」意图（写操作）。
+fn issue_create_reply(arg: &str) -> Reply {
+    if arg.is_empty() {
+        return Reply::Text(String::from(
+            "用法：/提单 <标题> — 在仓库建一条 issue（需 GH_WRITE=1）",
+        ));
+    }
+    Reply::IssueCreate(arg.chars().take(200).collect())
+}
+
+/// `/网站`：缺参数或非 http(s) 地址给用法，否则声明「抓取网页」意图。
+fn web_reply(arg: &str) -> Reply {
+    let url = arg.trim();
+    if url.is_empty() {
+        return Reply::Text(String::from("用法：/网站 <http(s) 地址>"));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Reply::Text(String::from("用法：/网站 <http(s) 地址>（仅支持 http/https）"));
+    }
+    Reply::WebFetch(String::from(url))
 }
 
 #[cfg(test)]
@@ -298,5 +387,73 @@ mod tests {
         // 非指令的纯数字/英文同样进问答。
         assert!(matches!(dispatch("123", 0, 0).unwrap(), Reply::Ask(_)));
         assert!(matches!(dispatch("help", 0, 0).unwrap(), Reply::Ask(_)));
+    }
+
+    #[test]
+    fn memory_commands_declare_intents() {
+        // `/记` 带内容 → Remember（内容原样携带）。
+        let Reply::Remember(content) = dispatch("/记 服务器 IP 是 1.2.3.4", 0, 0).unwrap() else {
+            panic!("/记 must declare Remember");
+        };
+        assert_eq!(content, "服务器 IP 是 1.2.3.4");
+        // `/记` 空参数 → 用法提示（不装死）。
+        let Reply::Text(text) = dispatch("/记", 0, 0).unwrap() else {
+            panic!("/记 without arg must reply usage");
+        };
+        assert!(text.contains("用法"), "usage missing: {text}");
+        // `/忆` 带关键词 → Recall。
+        let Reply::Recall(keyword) = dispatch("/忆 掉线", 0, 0).unwrap() else {
+            panic!("/忆 must declare Recall");
+        };
+        assert_eq!(keyword, "掉线");
+        // `/忆` 不带关键词 → 空串（由接收端解释为「重要记忆概览」）。
+        assert_eq!(dispatch("/忆", 0, 0).unwrap(), Reply::Recall(String::new()));
+    }
+
+    #[test]
+    fn issue_and_tool_commands_declare_intents() {
+        let Reply::IssueSearch(query) = dispatch("/issue 卫戍协议", 0, 0).unwrap() else {
+            panic!("/issue must declare IssueSearch");
+        };
+        assert_eq!(query, "卫戍协议");
+        let Reply::Text(text) = dispatch("/issue", 0, 0).unwrap() else {
+            panic!("/issue without arg must reply usage");
+        };
+        assert!(text.contains("用法"), "usage missing: {text}");
+        assert_eq!(dispatch("/话题", 0, 0).unwrap(), Reply::Topic);
+        assert_eq!(dispatch("/mc", 0, 0).unwrap(), Reply::Minecraft);
+        // 运维自省：两个别名集合都要能落到对应意图（排障入口不能失联）。
+        assert_eq!(dispatch("/版本", 0, 0).unwrap(), Reply::Version);
+        assert_eq!(dispatch("/version", 0, 0).unwrap(), Reply::Version);
+        assert_eq!(dispatch("/自检", 0, 0).unwrap(), Reply::SelfCheck);
+        assert_eq!(dispatch("/体检", 0, 0).unwrap(), Reply::SelfCheck);
+        let Reply::WebFetch(url) = dispatch("/网站 https://example.com", 0, 0).unwrap() else {
+            panic!("/网站 must declare WebFetch");
+        };
+        assert_eq!(url, "https://example.com");
+        // 非 http(s) 地址拦截在分发层（连意图都不声明）。
+        let Reply::Text(text) = dispatch("/网站 ftp://x", 0, 0).unwrap() else {
+            panic!("non-http url must reply usage");
+        };
+        assert!(text.contains("用法"), "usage missing: {text}");
+        // `/提单`：建 issue 的写操作意图（能否执行由接收端 GH_WRITE 决定）。
+        let Reply::IssueCreate(title) = dispatch("/提单 卫戍协议掉线", 0, 0).unwrap() else {
+            panic!("/提单 must declare IssueCreate");
+        };
+        assert_eq!(title, "卫戍协议掉线");
+        let Reply::Text(text) = dispatch("/提单", 0, 0).unwrap() else {
+            panic!("/提单 without arg must reply usage");
+        };
+        assert!(text.contains("用法"), "usage missing: {text}");
+    }
+
+    #[test]
+    fn help_lists_memory_and_tool_commands() {
+        let Reply::Text(text) = dispatch("/帮助", 0, 0).unwrap() else {
+            panic!("帮助 must reply");
+        };
+        for cmd in ["/记", "/忆", "/issue", "/提单", "/话题", "/网站", "/mc"] {
+            assert!(text.contains(cmd), "help missing {cmd}: {text}");
+        }
     }
 }
