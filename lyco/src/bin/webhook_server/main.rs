@@ -208,6 +208,8 @@ enum ReplyBody {
     Minecraft,
     /// 需要展示构建版本与运行时长（`/版本`）。
     Version,
+    /// 读取 GitHub 客户端仓库最新 Release（只读）。
+    ClientRelease,
     /// 需要对各接缝做体检（`/自检`）：记忆库 / gh / 问答后端 / 网页 / MC。
     SelfCheck,
 }
@@ -868,6 +870,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         CommandReply::WebFetch(url) => ReplyBody::WebFetch(url),
         CommandReply::Minecraft => ReplyBody::Minecraft,
         CommandReply::Version => ReplyBody::Version,
+        CommandReply::ClientRelease => ReplyBody::ClientRelease,
         CommandReply::SelfCheck => ReplyBody::SelfCheck,
         CommandReply::Skip => return Ok(None),
     };
@@ -920,6 +923,7 @@ fn reply_worker(config: Config, body: Vec<u8>) {
         ReplyBody::WebFetch(url) => web_fetch_text(&config, url),
         ReplyBody::Minecraft => mc_status_text(&config),
         ReplyBody::Version => version_text(&config),
+        ReplyBody::ClientRelease => client_release_text(&config),
         ReplyBody::SelfCheck => self_check_text(&config),
     };
     // 观测：回复正文只在 print_events 打开时落日志（默认与事件打印同开关）。
@@ -1238,6 +1242,20 @@ fn version_text(config: &Config) -> String {
         if config.topic.is_empty() { "未设置" } else { &config.topic }
     ));
     lines.join("\n")
+}
+
+/// 查询客户端仓库的真实最新 Release；不让模型猜版本号。
+#[cfg(feature = "tools")]
+fn client_release_text(config: &Config) -> String {
+    match tools::gh_client_release(&config.gh) {
+        Ok(text) => truncate_answer(&text, 600),
+        Err(err) => format!("客户端版本查询失败：{}", truncate_answer(&err, 250)),
+    }
+}
+
+#[cfg(not(feature = "tools"))]
+fn client_release_text(_config: &Config) -> String {
+    String::from("客户端版本查询未启用（需以 tools feature 构建）")
 }
 
 /// `/自检`：逐条接缝体检，告诉你「哪条通了、哪条为什么不通」。
