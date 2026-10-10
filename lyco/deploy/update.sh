@@ -15,6 +15,7 @@
 #   update.sh            # 检查并按需更新（幂等）
 #   update.sh --check    # 只看远端版本与本地是否一致，不动任何文件
 #   UPDATE_SOURCE=static UPDATE_BASE_URL=https://example.com/qqbot update.sh
+#   RESTART_CMD='supervisorctl restart qqbot' update.sh   # 非 systemd 的进程管理器
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/home/radxa/qq_bot}"
@@ -82,12 +83,13 @@ mkdir -p "$STATE_DIR"
 # ── 本地版本 ────────────────────────────────────────────────────────────
 current_version() {
   if [ -s "$VERSION_FILE" ]; then
-    head -n 1 "$VERSION_FILE" | tr -d '[:space:]'
+    # 单进程 awk：不要用 `head -n 1 |` —— 见文件末尾「pipefail 陷阱」。
+    awk 'NR==1{gsub(/[[:space:]]/,"");print}' "$VERSION_FILE"
     return
   fi
   # 没有 VERSION 文件（首次接管的老部署）：问二进制自己；问不到就当作未知。
   if [ -x "${APP_DIR}/${BIN_NAME}" ]; then
-    "${APP_DIR}/${BIN_NAME}" --version 2>/dev/null | head -n 1 | awk '{print $2}'
+    "${APP_DIR}/${BIN_NAME}" --version 2>/dev/null | awk 'NR==1{print $2}'
   fi
 }
 
@@ -104,12 +106,14 @@ remote_version() {
       curl -fsS --max-time "$UPDATE_TIMEOUT" "${auth[@]}" \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" |
-        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+        awk 'match($0,/"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/){v=substr($0,RSTART,RLENGTH);sub(/.*"/,"",v);sub(/"$/,"",v);print v;exit}'
     fi
     ;;
   static)
     [ -n "$UPDATE_BASE_URL" ] || die "static 模式必须设置 UPDATE_BASE_URL"
-    curl -fsS --max-time "$UPDATE_TIMEOUT" "${UPDATE_BASE_URL}/latest.txt" | head -n 1
+    # 端点只输出一行；用 awk 一次性取首行，避免 `head -n 1` 提前关闭管道。
+    curl -fsS --max-time "$UPDATE_TIMEOUT" "${UPDATE_BASE_URL}/latest.txt" |
+      awk 'NR==1{print;exit}'
     ;;
   *)
     die "未知 UPDATE_SOURCE=${UPDATE_SOURCE}（可选 github / static）"
@@ -177,12 +181,30 @@ rollback() {
   fi
 }
 
-# ── 重启服务（需要 sudo 无密码放行这三条命令，见 deploy/install.sh） ──
+# ── 能否重启服务 ────────────────────────────────────────────────────────
+#
+# ⚠️ 这里**故意不用** `systemctl list-unit-files | grep -q ...`：
+# grep -q 一命中就退出，systemctl 收到 SIGPIPE 以 141 结束；本脚本开了
+# `set -o pipefail`，于是整条管道被判失败 —— 结果是「明明装了单元却报未发现」，
+# 更新会静默跳过重启（2026-10-10 实机踩到）。改用无需管道的取值比较。
+unit_loaded() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ "$(systemctl show -p LoadState --value "$SERVICE" 2>/dev/null)" = "loaded" ]
+}
+
+# 重启能力探测：RESTART_CMD 是留给其它进程管理器（supervisor/自研守护）的逃生口。
+can_restart() {
+  [ -n "${RESTART_CMD:-}" ] && return 0
+  unit_loaded
+}
+
 restart_service() {
-  if ! command -v systemctl >/dev/null 2>&1 ||
-    ! systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}\.service"; then
-    log "WARN 未发现 systemd 单元 ${SERVICE}.service，跳过重启（只是换了二进制）"
+  if [ -n "${RESTART_CMD:-}" ]; then
+    sh -c "$RESTART_CMD" || die "RESTART_CMD 执行失败：${RESTART_CMD}"
     return 0
+  fi
+  if ! unit_loaded; then
+    die "无法重启：systemd 里没有 ${SERVICE}.service（可用 RESTART_CMD 指定其它方式）"
   fi
   if [ "$(id -u)" = "0" ]; then
     systemctl restart "$SERVICE"
@@ -212,6 +234,15 @@ if [ "$CUR" = "$LATEST" ]; then
 fi
 
 log "发现新版本 ${CUR:-未知} → ${LATEST}，开始更新"
+
+# 前置闸门：换二进制的前提是「有人能把它跑起来」。
+# 不能重启就别动文件 —— 否则文件换了、跑着的还是旧代码，接着被健康检查判失败再回滚，
+# 白折腾一轮还留下一堆备份。
+if ! can_restart; then
+  log "WARN 有新版但无法重启服务（未装 ${SERVICE}.service，且未设 RESTART_CMD）—— 保持现状，不动二进制"
+  exit 0
+fi
+
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -268,3 +299,19 @@ ls -1t "${STATE_DIR}"/prev-*."${BIN_NAME}" 2>/dev/null |
   done
 
 exit 0
+
+# ─────────────────────────────────────────────────────────────────────────
+# pipefail 陷阱（2026-10-10 实机踩到，值得单独记一笔）
+#
+# 本脚本开了 `set -euo pipefail`。凡是用「提前退出的读取器」收尾的管道，
+# 上游会收到 SIGPIPE（退出码 141），pipefail 就把它当成整条管道失败：
+#
+#   ❌ systemctl list-unit-files | grep -q "^qqbot.service"   # 命中即 SIGPIPE → 141
+#   ❌ curl ... | head -n 1                                   # 同理
+#   ✅ systemctl show -p LoadState --value qqbot              # 不用管道
+#   ✅ ... | awk 'NR==1{print;exit}'                          # awk 一次性读完
+#
+# 症状特别阴：交互 shell 里手敲同样的命令一切正常，只有在 `set -o pipefail`
+# 的脚本里才失败，于是「明明装了 systemd 单元却报未发现，静默跳过重启」。
+# 改这个文件时请守住上面两条 ✅ 的写法。
+# ─────────────────────────────────────────────────────────────────────────
