@@ -55,6 +55,9 @@ jobs:
       - name: Test (bin, tools)
         run: cargo test --locked --bin webhook_server --features tools
 
+      - name: Test (bin, memory + tools + vision)
+        run: cargo test --locked --bin webhook_server --features memory,tools,vision
+
       - name: Build aarch64-unknown-linux-musl
         env:
           # 版本 = tag 名；/healthz 会把它报给自更新脚本比对。
@@ -63,7 +66,7 @@ jobs:
         run: |
           cargo zigbuild --locked --release \
             --target aarch64-unknown-linux-musl \
-            --features memory,tools
+            --features memory,tools,vision
 
       # 更新脚本也作为资产发布：Radxa 上那份 update.sh 会自替换（见 deploy/update.sh
       # 的 self_update），所以脚本改动同样只需要推一个 tag，不必手工 scp。

@@ -58,6 +58,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod memory;
 #[cfg(feature = "tools")]
 mod tools;
+#[cfg(feature = "vision")]
+mod vision;
 
 /// 请求头缓冲上限（QQ 回调头远小于此值）。
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -210,6 +212,9 @@ enum ReplyBody {
     Version,
     /// 读取 GitHub 客户端仓库最新 Release（只读）。
     ClientRelease,
+    /// 受控下载 QQ 图片后发送给多模态模型做 OCR 和视觉问答。
+    #[cfg(feature = "vision")]
+    ImageQa { url: String, question: String },
     /// 需要对各接缝做体检（`/自检`）：记忆库 / gh / 问答后端 / 网页 / MC。
     SelfCheck,
 }
@@ -859,6 +864,24 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
     // QQ 图片到达时不能静默跳过，更不能假装 AI 已读图。
     // 暂不下载附件：其 URL 属于外部不可信输入，待接入受控视觉通道后再处理。
     if parsed.has_attachments {
+        #[cfg(feature = "vision")]
+        if let Some(url) = vision::extract_image_url(body) {
+            return Ok(Some(ReplyJob {
+                is_group,
+                openid,
+                msg_id: parsed.msg_id,
+                event_type: parsed.event_type,
+                actor: parsed.user_openid.clone().unwrap_or_default(),
+                body: ReplyBody::ImageQa {
+                    url,
+                    question: if parsed.content.trim().is_empty() {
+                        "请描述这张图片并识别其中可见文字".to_string()
+                    } else {
+                        parsed.content.clone()
+                    },
+                },
+            }));
+        }
         return Ok(Some(ReplyJob {
             is_group,
             openid,
@@ -866,7 +889,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
             event_type: parsed.event_type,
             actor: parsed.user_openid.clone().unwrap_or_default(),
             body: ReplyBody::Text(String::from(
-                "已收到图片附件，但当前机器人尚不能读取图片内容。要登记 Bug，请用 /记 描述错误信息、复现步骤、系统和客户端版本；不要仅发送截图。"
+                "已收到图片附件，但当前机器人尚不能读取图片内容。要登记 Bug，请用 /记 描述错误信息、复现步骤、系统和客户端版本；不要仅发送截图。",
             )),
         }));
     }
@@ -938,6 +961,16 @@ fn reply_worker(config: Config, body: Vec<u8>) {
         ReplyBody::Minecraft => mc_status_text(&config),
         ReplyBody::Version => version_text(&config),
         ReplyBody::ClientRelease => client_release_text(&config),
+        #[cfg(feature = "vision")]
+        ReplyBody::ImageQa { url, question } => {
+            match vision::answer_image(url, question, config.qa.max_chars) {
+                Ok(answer) => answer,
+                Err(err) => {
+                    logln("WARN", &format!("image qa failed: {err}"));
+                    format!("图片识别暂不可用：{err}。请补充截图上的错误文字或稍后重试。")
+                }
+            }
+        }
         ReplyBody::SelfCheck => self_check_text(&config),
     };
     // 观测：回复正文只在 print_events 打开时落日志（默认与事件打印同开关）。
@@ -1025,7 +1058,10 @@ fn answer_question(
     let asked = if config.topic.is_empty() {
         format!("{capability_note}\n群聊提问：{question}")
     } else {
-        format!("{capability_note}\n当前群话题：{}\n群聊提问：{question}", config.topic)
+        format!(
+            "{capability_note}\n当前群话题：{}\n群聊提问：{question}",
+            config.topic
+        )
     };
     match ask_zerostack(config, &asked) {
         Ok(answer) => {
@@ -1051,7 +1087,10 @@ fn answer_question(
                     ISSUE_IMPORTANCE,
                     unix_now(),
                 ) {
-                    logln("WARN", &format!("memory remember failed event={label}: {err}"));
+                    logln(
+                        "WARN",
+                        &format!("memory remember failed event={label}: {err}"),
+                    );
                 }
             }
             answer
@@ -1071,7 +1110,10 @@ fn answer_question(
 /// 重要事实用较高的基础重要度 → 半衰期明显更长，不会像闲聊那样隔夜就忘。
 /// 同一条内容重复记入时不会新增条目，而是「频次 +1、强度回补」（越提越牢）。
 // feature 关闭时入参无消费方（降级路径直接返回文案）：显式允许，不改签名。
-#[cfg_attr(not(all(feature = "memory", feature = "tools")), allow(unused_variables))]
+#[cfg_attr(
+    not(all(feature = "memory", feature = "tools")),
+    allow(unused_variables)
+)]
 fn remember_text(config: &Config, content: &str, scope: &str, actor: &str) -> String {
     #[cfg(feature = "memory")]
     {
@@ -1107,7 +1149,10 @@ fn remember_text(config: &Config, content: &str, scope: &str, actor: &str) -> St
 ///
 /// 命中本身会强化记忆（被想起 → 记得更牢），这与人类回忆一致。
 // feature 关闭时入参无消费方（降级路径直接返回文案）：显式允许，不改签名。
-#[cfg_attr(not(all(feature = "memory", feature = "tools")), allow(unused_variables))]
+#[cfg_attr(
+    not(all(feature = "memory", feature = "tools")),
+    allow(unused_variables)
+)]
 fn recall_text(config: &Config, keyword: &str, scope: &str) -> String {
     #[cfg(feature = "memory")]
     {
@@ -1176,7 +1221,10 @@ fn recall_text(config: &Config, keyword: &str, scope: &str) -> String {
 ///
 /// 两路都失败才有意义地报错；任一成功即给出该路结果（不因一路失败而全盘报错）。
 // feature 关闭时入参无消费方（降级路径直接返回文案）：显式允许，不改签名。
-#[cfg_attr(not(all(feature = "memory", feature = "tools")), allow(unused_variables))]
+#[cfg_attr(
+    not(all(feature = "memory", feature = "tools")),
+    allow(unused_variables)
+)]
 fn issue_search_text(config: &Config, query: &str, scope: &str) -> String {
     // 关掉 tools 时这一路不推内容，`mut` 无消费方。
     #[cfg_attr(not(feature = "tools"), allow(unused_mut))]
@@ -1249,11 +1297,19 @@ fn version_text(config: &Config) -> String {
     lines.push(format!("问答后端：{backends}"));
     lines.push(format!(
         "记忆库：{}",
-        if memory_ready(config) { "已启用" } else { "未启用" }
+        if memory_ready(config) {
+            "已启用"
+        } else {
+            "未启用"
+        }
     ));
     lines.push(format!(
         "话题：{}",
-        if config.topic.is_empty() { "未设置" } else { &config.topic }
+        if config.topic.is_empty() {
+            "未设置"
+        } else {
+            &config.topic
+        }
     ));
     lines.join("\n")
 }
@@ -1297,14 +1353,18 @@ fn self_check_text(config: &Config) -> String {
             }
             Err(err) => lines.push(format!("记忆库：查询失败（{err}）")),
         },
-        None => lines.push(String::from("记忆库：未启用（DB 打开失败或 memory feature 关闭）")),
+        None => lines.push(String::from(
+            "记忆库：未启用（DB 打开失败或 memory feature 关闭）",
+        )),
     };
     #[cfg(not(feature = "memory"))]
     lines.push(String::from("记忆库：本二进制未编译 memory feature"));
 
     // 2) 问答后端候选链（只探可用性，不真的发一次问答——体检不能花钱）
     if !config.qa.enabled {
-        lines.push(String::from("问答后端：已关闭（WEBHOOK_QA=0 或候选链为空）"));
+        lines.push(String::from(
+            "问答后端：已关闭（WEBHOOK_QA=0 或候选链为空）",
+        ));
     } else {
         for bin in &config.qa.bins {
             match probe_bin(bin) {
@@ -1323,15 +1383,27 @@ fn self_check_text(config: &Config) -> String {
         }
         lines.push(format!(
             "gh 仓库：{}",
-            if config.gh.repo.is_empty() { "未配置" } else { &config.gh.repo }
+            if config.gh.repo.is_empty() {
+                "未配置"
+            } else {
+                &config.gh.repo
+            }
         ));
         lines.push(format!(
             "我的世界后台：{}",
-            if config.mc.api_url.is_empty() { "未配置" } else { &config.mc.api_url }
+            if config.mc.api_url.is_empty() {
+                "未配置"
+            } else {
+                &config.mc.api_url
+            }
         ));
         lines.push(format!(
             "网页抓取：{}（上限 {} 字）",
-            if config.web.allow_private { "允许内网" } else { "仅公网" },
+            if config.web.allow_private {
+                "允许内网"
+            } else {
+                "仅公网"
+            },
             config.web.max_chars
         ));
     }
@@ -2063,7 +2135,10 @@ fn ask_zerostack(config: &Config, question: &str) -> Result<String, String> {
                     // 主后端失效、由后备顶上：留痕（不泄露问题正文），但不打扰用户。
                     logln(
                         "WARN",
-                        &format!("qa backend fell back to {bin}; earlier: {}", failures.join("; ")),
+                        &format!(
+                            "qa backend fell back to {bin}; earlier: {}",
+                            failures.join("; ")
+                        ),
                     );
                 }
                 return Ok(answer);
@@ -2612,7 +2687,23 @@ mod tests {
             super::ReplyBody::Minecraft => panic!("expected Text, got Minecraft"),
             super::ReplyBody::Version => panic!("expected Text, got Version"),
             super::ReplyBody::ClientRelease => panic!("expected Text, got ClientRelease"),
+            #[cfg(feature = "vision")]
+            super::ReplyBody::ImageQa { .. } => panic!("expected Text, got ImageQa"),
             super::ReplyBody::SelfCheck => panic!("expected Text, got SelfCheck"),
+        }
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn group_photo_reaches_multimodal_reply() {
+        let body = br#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"m","group_openid":"g","content":"What error?","attachments":[{"content_type":"image/png","url":"https://gchat.qpic.cn/images/0"}]}}"#;
+        let job = super::plan_reply(body, 0, 0).unwrap().unwrap();
+        match job.body {
+            super::ReplyBody::ImageQa { url, question } => {
+                assert_eq!(url, "https://gchat.qpic.cn/images/0");
+                assert_eq!(question, "What error?");
+            }
+            _ => panic!("expected multimodal image job"),
         }
     }
 
@@ -2983,8 +3074,12 @@ mod tests {
         assert!(super::looks_like_tool_invocation(
             r#"{"tool_calls":[{"function":{"name":"bash"}}]}"#
         ));
-        assert!(!super::looks_like_tool_invocation("我无法查询最新版本，建议查看 Release"));
-        assert!(!super::looks_like_tool_invocation("{\"version\":\"0.2.3\"}"));
+        assert!(!super::looks_like_tool_invocation(
+            "我无法查询最新版本，建议查看 Release"
+        ));
+        assert!(!super::looks_like_tool_invocation(
+            "{\"version\":\"0.2.3\"}"
+        ));
     }
 
     #[test]
