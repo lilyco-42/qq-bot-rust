@@ -28,6 +28,8 @@ pub enum Reply {
     /// 与 [`Reply::ServerStatus`] 同一模式：分发层无 IO，只声明意图；
     /// 实际请求（需机器人专用账号登录）在接收端完成。
     LobbyRooms,
+    /// 只读查询游戏进程的等待房间（不同于 /房间 的外部组队大厅）。
+    StrongholdRooms,
     /// 需要「记住」的内容（`/记`）：由调用方写入记忆库（重要事实，重要度高）。
     Remember(String),
     /// 需要「回忆」的关键词（`/忆`）：由调用方检索记忆库。
@@ -107,6 +109,7 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "对局" | "状态" | "服务器" | "status" | "server" => Reply::ServerStatus,
         // 组队大厅房间列表（等待中的房间）：需机器人专用账号，请求在接收端完成。
         "房间" | "组队" | "大厅" | "rooms" | "lobby" => Reply::LobbyRooms,
+        "游戏房间" | "卫戍房间" | "sp房间" | "gamerooms" => Reply::StrongholdRooms,
         // 记忆：写入/检索持久化记忆库（接收端完成；未启用 memory 时给出提示）。
         "记" | "记住" | "remember" => remember_reply(rest),
         // 回忆：空关键词 = 概览（该作用域下最重要的若干条），故不判空。
@@ -139,6 +142,7 @@ fn help_text() -> String {
          /复读 <文本> — 原样返回（≤140 字）\n\
          /对局 — 服务器对局/等待状态\n\
          /房间 — 组队大厅等待中的房间\n\
+         /游戏房间 — 游戏服务器等待房间、人数及难度\n\
          /记 <内容> — 记下重要信息（会强化、不易忘）\n\
          /忆 [关键词] — 回忆（不带词=重要记忆概览）\n\
          /issue <关键词> — 查是否有人问过（记忆+仓库 issue）\n\
@@ -410,6 +414,14 @@ mod tests {
             panic!("帮助 must reply");
         };
         assert!(text.contains("/房间"), "help missing /房间: {text}");
+    }
+
+    #[test]
+    fn game_room_command_is_separate_from_external_lobby() {
+        for input in ["/游戏房间", "/卫戍房间", "/sp房间", "/gamerooms"] {
+            assert_eq!(dispatch(input, 0, 0).unwrap(), Reply::StrongholdRooms);
+        }
+        assert_eq!(dispatch("/房间", 0, 0).unwrap(), Reply::LobbyRooms);
     }
 
     #[test]
