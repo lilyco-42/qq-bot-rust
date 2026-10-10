@@ -93,8 +93,8 @@ fn render_client_release(raw: &str) -> Result<String, String> {
         "安装包是否可用请查看 Release 的实际附件。"
     };
     Ok(format!(
-        "StrongholdProtocolClient 最新 Release：{tag}\\n发布时间（UTC）：{published}\\n{note}\\n来源：{url}"
-    ).replace("\\\\n", "\\n"))
+        "StrongholdProtocolClient 最新 Release：{tag}\n发布时间（UTC）：{published}\n{note}\n来源：{url}"
+    ))
 }
 
 /// 创建 issue（写操作，需 [`GhConfig::write_enabled`]）。
