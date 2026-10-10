@@ -33,6 +33,9 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # 其中 fts 模块在当前 nightly 下编译失败（自定义 allocator 类型不匹配），
 # 而记忆检索走 LIKE + 自研评分，不需要 FTS；去掉两者同时为静态二进制瘦身。
 turso = { version = "0.8.2", default-features = false, optional = true }
+# Turso 的传递依赖 branches 0.4.6 若禁用 std 会调用已删除的 core::intrinsics::abort。
+# 仅当 memory 启用时统一打开 branches/std，不影响默认的 no_std 核心构建。
+branches = { version = "=0.4.6", default-features = false, features = ["std"], optional = true }
 
 [features]
 default = []
@@ -50,7 +53,7 @@ gateway-wtx = [
 ]
 # 记忆/issue 沉淀：SQLite 兼容的 Turso 本地库（人类式遗忘曲线 + 频次强化）。
 # 启用后接收端 bin 获得持久化记忆；核心库仍保持 no_std + alloc，不引用 turso。
-memory = ["dep:turso", "dep:tokio"]
+memory = ["dep:turso", "dep:tokio", "dep:branches"]
 # 资源调用层：gh cli / 网页抓取 / Minecraft 后台（无新增依赖，复用 ureq）。
 tools = []
 
