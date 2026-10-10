@@ -74,6 +74,22 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
     if text.is_empty() {
         return Ok(Reply::Skip);
     }
+    // 群聊 @机器人 的内容通常没有 / 前缀；Bug 报告必须进入持久化记忆，
+    // 不能误送给一次性 AI 问答。严守命令前缀边界，普通讨论不触发存储。
+    let normalize_bug = |input: &str| {
+        ["bug记录", "BUG记录", "Bug记录", "bug反馈", "BUG反馈", "问题记录"]
+            .iter().find_map(|prefix| input.strip_prefix(prefix))
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)
+                || rest.starts_with([':', '：']))
+    };
+    if let Some(rest) = normalize_bug(text) {
+        let details = rest.trim_start_matches([':', '：', ' ', '\t']).trim();
+        return Ok(if details.is_empty() {
+            Reply::Text("用法：@lyco bug记录 <问题描述>（需真正 @ 机器人）".into())
+        } else {
+            remember_reply(&format!("[游戏Bug反馈] {details}"))
+        });
+    }
     // 指令必须以 `/` 开头；无前缀的普通消息交给 AI 问答。
     let Some(after_slash) = text.strip_prefix('/') else {
         // 自然语言「记住……」必须真正写库，而不是仅交给 LLM 复述。
@@ -118,6 +134,10 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         },
         // 记忆：写入/检索持久化记忆库（接收端完成；未启用 memory 时给出提示）。
         "记" | "记住" | "remember" => remember_reply(rest),
+        "bug记录" | "bug反馈" | "BUG记录" | "bug" => {
+            if rest.is_empty() { Reply::Text("用法：/bug记录 <问题描述>".into()) }
+            else { remember_reply(&format!("[游戏Bug反馈] {rest}")) }
+        },
         // 回忆：空关键词 = 概览（该作用域下最重要的若干条），故不判空。
         "忆" | "回忆" | "recall" => Reply::Recall(rest.to_string()),
         // 同类 issue 检索：本地记忆 + gh cli 搜仓库，接收端合并成文。
@@ -151,6 +171,7 @@ fn help_text() -> String {
          /游戏房间 — 游戏服务器等待房间、人数及难度\n\
          /夸克转存 <链接> — 管理员把分享存到指定夸克网盘\n\
          /记 <内容> — 记下重要信息（会强化、不易忘）\n\
+         /bug记录 <描述> — 把游戏问题记录到群记忆\n\
          /忆 [关键词] — 回忆（不带词=重要记忆概览）\n\
          /issue <关键词> — 查是否有人问过（记忆+仓库 issue）\n\
          /提单 <标题> — 在仓库建一条 issue（需开启 GH_WRITE）\n\
@@ -442,6 +463,20 @@ mod tests {
             dispatch("/网盘转存 https://pan.quark.cn/s/abc123", 0, 0).unwrap(),
             Reply::QuarkSave("https://pan.quark.cn/s/abc123".into()),
         );
+    }
+
+    #[test]
+    fn bug_report_mention_routes_to_group_memory_instead_of_ai() {
+        let expected = Reply::Remember("[游戏Bug反馈] 有bug 隐身怪会空放技能，主要是无伤害".into());
+        for input in [
+            "bug记录 有bug 隐身怪会空放技能，主要是无伤害",
+            "BUG记录：有bug 隐身怪会空放技能，主要是无伤害",
+            "/bug记录 有bug 隐身怪会空放技能，主要是无伤害",
+        ] {
+            assert_eq!(dispatch(input, 0, 0).unwrap(), expected, "input={input}");
+        }
+        assert!(matches!(dispatch("bug记录", 0, 0).unwrap(), Reply::Text(_)));
+        assert!(matches!(dispatch("bug记录器是什么", 0, 0).unwrap(), Reply::Ask(_)));
     }
 
     #[test]
