@@ -331,9 +331,9 @@ impl Store {
             let conn = self.conn.lock().await;
             let rows = conn
                 .query(
-                    "SELECT id, kind, scope, subject, content, answer, actor, importance, freq, \\
-                     strength, created_at, last_seen_at FROM memories \\
-                     WHERE (scope = ?1 OR scope = '*') AND kind = 'fact' \\
+                    "SELECT id, kind, scope, subject, content, answer, actor, importance, freq,
+                     strength, created_at, last_seen_at FROM memories
+                     WHERE (scope = ?1 OR scope = '*') AND kind = 'fact'
                        AND (subject LIKE ?2 OR content LIKE ?2)",
                     (scope.to_string(), pattern),
                 )
