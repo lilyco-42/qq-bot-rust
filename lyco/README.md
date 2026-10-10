@@ -94,7 +94,7 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl --features memory,t
 # 可选：WEBHOOK_LOBBY=0 关 /房间 房间查询；LOBBY_USER / LOBBY_PASS = 大厅机器人专用账号
 # 可选：MEMORY_DB（默认 memory.db）记忆库路径；BOT_TOPIC（默认「明日方舟卫戍协议」）群默认话题
 # 可选：GH_REPO=owner/repo（/issue 检索、/提单 建单）；GH_WRITE=1 才允许 gh 写操作（默认关闭）
-# 可选：QA_READONLY_MCP=1 让 ZeroStack 自主搜索只读 GitHub / 网页 / 游戏状态（默认关闭，见 mcp/README.md）。
+# 可选：QA_READONLY_MCP=1 让 ZeroStack 自主搜索只读 GitHub / PRTS Wiki / 网页 / 游戏状态，并引用仓库 lyco-skill 的内置研究准则（默认关闭，见 mcp/README.md）。
 # 可选：MINECRAFT_API_URL（/mc 我的世界后台）；WEB_FETCH_ALLOW_PRIVATE=1 才允许 /网站 抓内网
 # AI 问答（zerostack v1.8.4，aarch64-musl 静态单二进制 → ~/.local/bin/）：
 #   ~/.config/zerostack/config.toml            # provider=nim，model=nvidia/nemotron-3-super-120b-a12b

@@ -9,11 +9,31 @@ spec.loader.exec_module(m)
 
 class GatewayTest(TestCase):
     def test_explicit_allowlist(self):
-        self.assertEqual(len(m.TOOLS), 5)
+        self.assertEqual(len(m.TOOLS), 7)
         self.assertNotIn("bash", [x["name"] for x in m.TOOLS])
         for name in ("write", "exec", "github_issue_create", "file_edit"):
             with self.assertRaises(ValueError):
                 m.dispatch(name, {})
+    def test_prts_search_safe_and_sourced(self):
+        with patch.object(m, "_prts_api", return_value=["凯尔希", ["凯尔希"], [""], ["https://prts.wiki/w/凯尔希"]]) as api:
+            parsed = __import__("json").loads(m.prts_search({"query":"凯尔希"}))
+        self.assertEqual(parsed["results"][0]["title"],"凯尔希")
+        self.assertEqual(api.call_args.args[0]["action"],"opensearch")
+        with self.assertRaises(ValueError):
+            m.prts_search({"query":"x"+chr(10)+"bad"})
+        with self.assertRaises(ValueError):
+            m.prts_page({"title":""})
+
+    def test_prts_page_reads_wikitext_fields(self):
+        def fake_api(params):
+            if params.get("prop") == "extracts":
+                return {"query":{"pages":{"42":{"title":"凯尔希","extract":"干员信息"}}}}
+            return {"query":{"pages":{"42":{"revisions":[{"slots":{"main":{"*":"|干员名=凯尔希\n|职业=医疗\n|干员id=char_003_kalts\n"}}}]}}}}
+        with patch.object(m,"_prts_api",side_effect=fake_api):
+            d=__import__("json").loads(m.prts_page({"title":"凯尔希"}))
+        self.assertEqual(d["fields"]["职业"],"医疗")
+        self.assertEqual(d["url"],"https://prts.wiki/w/"+m.urllib.parse.quote(d["title"],safe="():"))
+
     def test_ssrf_denied(self):
         for url in ("http://127.0.0.1/", "https://10.0.0.1/", "https://localhost/",
                     "file:///etc/passwd", "https://github.com@localhost/",

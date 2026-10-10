@@ -6,6 +6,8 @@ This gateway connects ZeroStack to scoped, bounded, read-only public resources:
 - github_client_release: latest release and actual asset names.
 - game_status: public game health status.
 - public_page: text-only allowlisted HTTPS pages.
+- prts_search: search PRTS Wiki via the public MediaWiki OpenSearch API.
+- prts_page: read a named PRTS Wiki article and extract key operator fields.
 
 Rust still handles identity, scoped group memory, administrator commands,
 issue creation, QQ images and bot delivery. The public bot cannot use arbitrary
@@ -22,7 +24,7 @@ Deployment on Radxa:
 
 Security caveat: ZeroStack 1.8.4 treats every MCP call as privileged even in
 readonly mode. This bot invokes ZeroStack with dangerously-skip-permissions
-ONLY alongside an exact tools allowlist of the five names above. The gateway
+ONLY alongside an exact tools allowlist of the seven names above. The gateway
 itself implements no writes, no arbitrary commands and rejects private URLs.
 The subprocess receives an isolated XDG_CONFIG_HOME, no external hooks,
 context files or persistent sessions. Never expose bash/edit/write with these
@@ -36,3 +38,5 @@ Tests:
 
 A successful functional probe must show a real tool call rather than a
 text-only request pretending to call GitHub.
+
+The bot embeds the five core principles from the user-owned [lyco-skill](https://github.com/lilyco-42/lyco-skill) at pinned commit 2ca49373. Exact upstream SKILL.md is in lyco/skills/lyco/SKILL.md, tracked by SOURCE.md. Only the core philosophy is injected per QA turn; fixed trust boundaries remain separate. Updating the embedded copy requires review and a new build.
