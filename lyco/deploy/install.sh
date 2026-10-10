@@ -59,10 +59,16 @@ chmod 0440 /etc/sudoers.d/qqbot-update
 visudo -cf /etc/sudoers.d/qqbot-update
 
 # 旧部署可能还是 nohup 手工跑的：先收掉，免得两个进程抢同一个 webhook 端口。
+# 但**只收无主的**：已经由 systemd 托管的进程交给 systemctl 处理，
+# 否则重复执行本脚本会平白打断一次服务（本脚本必须幂等）。
 if pgrep -x webhook_server >/dev/null 2>&1; then
-  say "停掉手工启动的 webhook_server（交给 systemd 接管）"
-  pkill -x webhook_server || true
-  sleep 1
+  if systemctl is-active --quiet "${SERVICE}.service"; then
+    say "webhook_server 已由 ${SERVICE}.service 托管，跳过 kill（保持幂等）"
+  else
+    say "停掉手工启动的 webhook_server（交给 systemd 接管）"
+    pkill -x webhook_server || true
+    sleep 1
+  fi
 fi
 
 say "启动服务与定时器"

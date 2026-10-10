@@ -196,8 +196,12 @@ token（GH_TOKEN / 模型 API key）。
 |------|------|
 | `qqbot.service` | 常驻服务：`Restart=always`，崩溃 60s 内超 5 次则停下（不刷爆 QQ 接口） |
 | `qqbot-update.timer` | 每 10 分钟（±60s 抖动）触发一次更新检查 |
-| `update.sh` | 更新逻辑本体，幂等：版本没变就是 no-op |
+| `update.sh` | 更新逻辑本体，幂等：版本没变就是 no-op；**自己也在发版资产里，会自替换** |
 | `install.sh` | 一次性安装：单元 + sudo 免密规则（只放行 `systemctl restart qqbot`） |
+
+`update.sh` 自己也随 Release 发布（`update.sh` + `.sha256`），更新成功后**原子自替换**
+（`mv` 换名而非覆盖写：覆盖写会截断正在被 bash 逐行解析的脚本）。所以改更新脚本同样是
+「推个 tag」了事。只想换脚本不想等二进制：`./update.sh --self`。老脚本会留作 `update.sh.prev`。
 
 ### update.sh 的四道闸门（都是被真实翻车方式逼出来的）
 

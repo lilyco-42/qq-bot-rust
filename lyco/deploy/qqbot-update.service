@@ -12,6 +12,8 @@ WorkingDirectory=/home/radxa/qq_bot
 # 更新脚本自己读 env.sh（含 GH_TOKEN）与可选 update.env。
 ExecStart=/home/radxa/qq_bot/update.sh
 
-# 更新失败不要拖垮后续调度：脚本自己会回滚并把原因写进 update.log。
-SuccessExitStatus=0
+# 更新脚本内部已经把失败处理完了（回滚 + update.log 记录原因），
+# 但**仍然让它以失败退出**：单元进入 failed 是刻意的可观测性——
+# 「自动回滚成功」这件事必须留下痕迹，否则版本永远升不上去也没人知道。
+# 失败的 oneshot 不会影响 timer 的后续调度。
 TimeoutStartSec=300
