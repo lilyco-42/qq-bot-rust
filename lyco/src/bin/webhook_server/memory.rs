@@ -297,7 +297,10 @@ impl Store {
             Self::collect_rows(rows).await
         })?;
 
-        let mut items = rows.iter().map(|row| row_to_memory(row)).collect::<Vec<_>>();
+        let mut items = rows
+            .iter()
+            .map(|row| row_to_memory(row))
+            .collect::<Vec<_>>();
         items.sort_by(|a, b| {
             b.score(now)
                 .partial_cmp(&a.score(now))
@@ -305,6 +308,46 @@ impl Store {
         });
         items.truncate(limit);
         // 命中即强化（此刻被想起 → 记得更牢）。
+        for item in &items {
+            self.reinforce(item.id, now)?;
+        }
+        Ok(items)
+    }
+
+    /// 仅检索已显式确认保存的事实，而不是普通 AI 问答。
+    /// 优先用于用户问版本更新时的知识库命中，防止错误的旧 AI 答案污染回答。
+    pub fn recall_facts(
+        &self,
+        scope: &str,
+        keyword: &str,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<Memory>, String> {
+        if keyword.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", keyword.trim());
+        let rows = self.rt.block_on(async {
+            let conn = self.conn.lock().await;
+            let rows = conn
+                .query(
+                    "SELECT id, kind, scope, subject, content, answer, actor, importance, freq, \\
+                     strength, created_at, last_seen_at FROM memories \\
+                     WHERE (scope = ?1 OR scope = '*') AND kind = 'fact' \\
+                       AND (subject LIKE ?2 OR content LIKE ?2)",
+                    (scope.to_string(), pattern),
+                )
+                .await
+                .map_err(|err| format!("turso recall facts: {err}"))?;
+            Self::collect_rows(rows).await
+        })?;
+        let mut items = rows.iter().map(|r| row_to_memory(r)).collect::<Vec<_>>();
+        items.sort_by(|a, b| {
+            b.score(now)
+                .partial_cmp(&a.score(now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        items.truncate(limit);
         for item in &items {
             self.reinforce(item.id, now)?;
         }
@@ -334,7 +377,10 @@ impl Store {
         let rows = self.rt.block_on(async {
             let conn = self.conn.lock().await;
             let rows = conn
-                .query("SELECT id, importance, strength, last_seen_at FROM memories", ())
+                .query(
+                    "SELECT id, importance, strength, last_seen_at FROM memories",
+                    (),
+                )
                 .await
                 .map_err(|err| format!("turso query: {err}"))?;
             Self::collect_rows(rows).await
@@ -446,6 +492,58 @@ fn row_to_memory(row: &[turso::Value]) -> Memory {
 #[cfg(test)]
 mod tests {
     use super::{FORGOTTEN, HALF_LIFE_BASE_DAYS, SCALE, decayed, normalize};
+
+    /// 在 Turso 本地数据库写入事实后，跨不同问题再次检索同一版本。
+    #[test]
+    fn persistent_fact_recalled_for_version_and_is_scope_isolated() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("qqbot-memory-{unique}-{}.db", std::process::id()));
+        let store = super::Store::open(path.to_str().unwrap()).unwrap();
+        let fact = "0.2.3 更新内容：新增六星克莱门莎，黍与乌尔比安新增模组，恢复本机对局。";
+        store
+            .remember(
+                super::KIND_FACT,
+                "AABB112233",
+                fact,
+                "",
+                "tester",
+                3.0,
+                1000,
+            )
+            .unwrap();
+        store
+            .remember(
+                super::KIND_ISSUE,
+                "AABB112233",
+                "0.2.3 更新了什么？",
+                "不知道",
+                "tester",
+                1.0,
+                1000,
+            )
+            .unwrap();
+        let found = store.recall_facts("AABB112233", "0.2.3", 1100, 5).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "AI-generated issue is not an authoritative fact"
+        );
+        assert_eq!(found[0].content, fact);
+        assert!(
+            store
+                .recall_facts("OTHERGROUP", "0.2.3", 1100, 5)
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 
     /// 半衰期：经过一个半衰期，强度应恰好减半。
     #[test]

@@ -72,7 +72,22 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
     }
     // 指令必须以 `/` 开头；无前缀的普通消息交给 AI 问答。
     let Some(after_slash) = text.strip_prefix('/') else {
-        if text.contains("客户端") && (text.contains("最新版本") || text.contains("版本号")) {
+        // 自然语言「记住……」必须真正写库，而不是仅交给 LLM 复述。
+        // /忆 是查询命令；若用户误把 /忆 附在「记住…」后面，只提取其后的事实文本。
+        if let Some(rest) = text
+            .strip_prefix("记住")
+            .or_else(|| text.strip_prefix("请记住"))
+        {
+            let fact = if let Some((_, trailing)) = rest.rsplit_once("/忆 ") {
+                trailing.trim()
+            } else {
+                rest.trim_start_matches(&['：', ':', ' ', '，', ','][..])
+                    .trim()
+            };
+            return Ok(remember_reply(fact));
+        }
+        if text.contains("客户端") && (text.contains("最新版本") || text.contains("版本号"))
+        {
             return Ok(Reply::ClientRelease);
         }
         return Ok(Reply::Ask(text.to_string()));
@@ -233,7 +248,9 @@ fn web_reply(arg: &str) -> Reply {
         return Reply::Text(String::from("用法：/网站 <http(s) 地址>"));
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Reply::Text(String::from("用法：/网站 <http(s) 地址>（仅支持 http/https）"));
+        return Reply::Text(String::from(
+            "用法：/网站 <http(s) 地址>（仅支持 http/https）",
+        ));
     }
     Reply::WebFetch(String::from(url))
 }
@@ -244,6 +261,23 @@ mod tests {
 
     /// 2026-10-09 00:22:29 (UTC+8)（Radxa 抓取事件的时间戳）。
     const SAMPLE_UNIX: i64 = 1_791_476_549;
+
+    #[test]
+    fn natural_memory_intent_writes_instead_of_asking() {
+        let msg = "记住0.2.3更新内容，有人问你就回答这个。@lyco /忆 0.2.3 是 0.2.2 之后的常规更新：自选编队新增六星克莱门莎";
+        match dispatch(msg, 0, 0).unwrap() {
+            Reply::Remember(v) => assert!(v.starts_with("0.2.3 是 0.2.2")),
+            other => panic!("memory was not routed to storage: {other:?}"),
+        }
+        assert_eq!(
+            dispatch("记住：服务器每周维护", 0, 0).unwrap(),
+            Reply::Remember("服务器每周维护".to_string())
+        );
+        assert!(matches!(
+            dispatch("/忆 0.2.3", 0, 0).unwrap(),
+            Reply::Recall(_)
+        ));
+    }
 
     #[test]
     fn empty_content_is_skipped() {
@@ -381,8 +415,14 @@ mod tests {
     #[test]
     fn client_version_query_uses_readonly_intent() {
         assert_eq!(dispatch("/客户端版本", 0, 0).unwrap(), Reply::ClientRelease);
-        assert_eq!(dispatch("手机客户端最新版本是什么", 0, 0).unwrap(), Reply::ClientRelease);
-        assert!(matches!(dispatch("客户端怎么安装", 0, 0).unwrap(), Reply::Ask(_)));
+        assert_eq!(
+            dispatch("手机客户端最新版本是什么", 0, 0).unwrap(),
+            Reply::ClientRelease
+        );
+        assert!(matches!(
+            dispatch("客户端怎么安装", 0, 0).unwrap(),
+            Reply::Ask(_)
+        ));
     }
 
     #[test]
@@ -406,7 +446,8 @@ mod tests {
     #[test]
     fn memory_commands_declare_intents() {
         // `/记` 带内容 → Remember（内容原样携带）。
-        let Reply::Remember(content) = dispatch("/记 服务器 IP 是 1.2.3.4", 0, 0).unwrap() else {
+        let Reply::Remember(content) = dispatch("/记 服务器 IP 是 1.2.3.4", 0, 0).unwrap()
+        else {
             panic!("/记 must declare Remember");
         };
         assert_eq!(content, "服务器 IP 是 1.2.3.4");
@@ -451,7 +492,8 @@ mod tests {
         };
         assert!(text.contains("用法"), "usage missing: {text}");
         // `/提单`：建 issue 的写操作意图（能否执行由接收端 GH_WRITE 决定）。
-        let Reply::IssueCreate(title) = dispatch("/提单 卫戍协议掉线", 0, 0).unwrap() else {
+        let Reply::IssueCreate(title) = dispatch("/提单 卫戍协议掉线", 0, 0).unwrap()
+        else {
             panic!("/提单 must declare IssueCreate");
         };
         assert_eq!(title, "卫戍协议掉线");
