@@ -87,7 +87,7 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         return Ok(if details.is_empty() {
             Reply::Text("用法：@lyco bug记录 <问题描述>（需真正 @ 机器人）".into())
         } else {
-            remember_reply(&format!("[游戏Bug反馈] {details}"))
+            issue_create_reply(&format!("[Bug] {details}"))
         });
     }
     // 指令必须以 `/` 开头；无前缀的普通消息交给 AI 问答。
@@ -136,7 +136,7 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "记" | "记住" | "remember" => remember_reply(rest),
         "bug记录" | "bug反馈" | "BUG记录" | "bug" => {
             if rest.is_empty() { Reply::Text("用法：/bug记录 <问题描述>".into()) }
-            else { remember_reply(&format!("[游戏Bug反馈] {rest}")) }
+            else { issue_create_reply(&format!("[Bug] {rest}")) }
         },
         // 回忆：空关键词 = 概览（该作用域下最重要的若干条），故不判空。
         "忆" | "回忆" | "recall" => Reply::Recall(rest.to_string()),
@@ -171,10 +171,10 @@ fn help_text() -> String {
          /游戏房间 — 游戏服务器等待房间、人数及难度\n\
          /夸克转存 <链接> — 管理员把分享存到指定夸克网盘\n\
          /记 <内容> — 记下重要信息（会强化、不易忘）\n\
-         /bug记录 <描述> — 把游戏问题记录到群记忆\n\
+         /bug记录 <描述> — 管理员将游戏 Bug 提交为 GitHub Issue\n\
          /忆 [关键词] — 回忆（不带词=重要记忆概览）\n\
          /issue <关键词> — 查是否有人问过（记忆+仓库 issue）\n\
-         /提单 <标题> — 在仓库建一条 issue（需开启 GH_WRITE）\n\
+         /提单 <描述> — 管理员通过 ZeroStack + gh 创建 GitHub Issue\n\
          /话题 — 当前群默认话题\n\
          /网站 <url> — 抓取网页正文\n\
          /mc — 我的世界服务器状态\n\
@@ -270,7 +270,7 @@ fn issue_create_reply(arg: &str) -> Reply {
             "用法：/提单 <标题> — 在仓库建一条 issue（需 GH_WRITE=1）",
         ));
     }
-    Reply::IssueCreate(arg.chars().take(200).collect())
+    Reply::IssueCreate(arg.chars().take(700).collect())
 }
 
 /// `/网站`：缺参数或非 http(s) 地址给用法，否则声明「抓取网页」意图。
@@ -466,8 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn bug_report_mention_routes_to_group_memory_instead_of_ai() {
-        let expected = Reply::Remember("[游戏Bug反馈] 有bug 隐身怪会空放技能，主要是无伤害".into());
+    fn bug_report_mention_routes_to_issue_intent_instead_of_ai() {
+        let expected = Reply::IssueCreate("[Bug] 有bug 隐身怪会空放技能，主要是无伤害".into());
         for input in [
             "bug记录 有bug 隐身怪会空放技能，主要是无伤害",
             "BUG记录：有bug 隐身怪会空放技能，主要是无伤害",
