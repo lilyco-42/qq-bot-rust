@@ -22,7 +22,7 @@
 //! | `WEBHOOK_PRINT_EVENTS` | `1` | 是否打印已验签事件的原始报文 |
 //! | `WEBHOOK_REPLY` | `1` | 是否启用被动回复（`0` 关闭） |
 //! | `WEBHOOK_QA` | `1` | 是否启用 AI 问答（`0` 关闭；非 `/` 指令的普通消息） |
-//! | `ZEROSTACK_BIN` | `zerostack` | zerostack 可执行文件（空串等价于关闭问答） |
+//! | `ZEROSTACK_BIN` | `zerostack` | 问答后端候选链（逗号分隔，按序取第一个可用的；空 = 关问答） |
 //! | `QA_TIMEOUT_SECS` | `120` | 单次问答超时（5..=600 秒，超时回兜底文案） |
 //! | `QA_MAX_CHARS` | `1000` | 回答截断字数（50..=4000；平台无公开上限，保守截断） |
 //! | `QA_PROVIDER` | （zerostack 配置） | 覆盖 zerostack provider（`--provider`，如 `nim`/`openrouter`） |

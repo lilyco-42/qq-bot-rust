@@ -103,11 +103,35 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl --features memory,t
 #   切换后端：config.toml 内含 [custom_providers.openrouter]（openrouter.ai/api/v1，
 #     api_key_env=OPENROUTER_API_KEY）；env.sh 设 OPENROUTER_API_KEY + QA_PROVIDER=openrouter
 #     + QA_MODEL=<模型 id> 即可切到 OpenRouter，无需改代码
-# 启动（fd 全脱离，ssh 会话不挂起）：
-nohup sh -c 'cd ~/qq_bot && set -a && . ./env.sh && set +a && exec ./webhook_server >> server.log 2>&1' </dev/null >/dev/null 2>&1 &
+# 首装（一次性，之后不再需要 ssh 上来）：systemd 常驻 + 自更新定时器
+scp -r deploy radxa@192.168.10.165:~/qq_bot/
+ssh radxa@192.168.10.165 'sudo bash ~/qq_bot/deploy/install.sh'
 # 公网回调（无公网 IP 时的 cloudflared 快速隧道，URL 每次重启变化，需回控制台重配）：
 nohup sh -c 'cd ~/qq_bot && ./cloudflared tunnel --url http://127.0.0.1:8080 >> tunnel.log 2>&1' </dev/null >/dev/null 2>&1 &
 ```
+
+### ⚠️ `env.sh` 不要写 `export` 前缀（2026-10-10 实机踩坑）
+
+systemd 的 `EnvironmentFile=` **不认 shell 语法**：`export QQ_BOT_SECRET=...` 这一行会被
+当成非法赋值**整行忽略**（journal 里能看到 `Ignoring invalid environment assignment`），
+后果是服务起来了却因为「没拿到 secret」立刻 exit 1，而且重启循环。
+
+```sh
+# ✅ 正确：裸 KEY=VALUE（systemd 自动注入子进程环境）
+QQ_BOT_SECRET=...
+# ❌ 错误：export 前缀会被 systemd 丢掉
+export QQ_BOT_SECRET=...
+```
+
+需要手工 source 时用 `set -a` 补上导出语义：
+
+```sh
+set -a && . ./env.sh && set +a && ./webhook_server
+```
+
+⚠️ 附带教训：这个错误还会把**整行含密钥的内容原样写进 journal**。改完 `env.sh` 记得
+`sudo journalctl --rotate && sudo journalctl --vacuum-time=1s`，并视情况轮换泄露过的
+token（GH_TOKEN / 模型 API key）。
 
 - 回调地址：控制台 → 开发设置 → 事件订阅与回调 → 回调地址（HTTPS，仅 80/443/8080/8443）；
 - 自测工具：`SIGN_SECRET=... SIGN_TS=... SIGN_BODY='...' cargo run --example sign_event`
@@ -150,6 +174,73 @@ nohup sh -c 'cd ~/qq_bot && ./cloudflared tunnel --url http://127.0.0.1:8080 >> 
 - **gh 写操作默认关闭**：避免群成员随意在仓库建 issue；
 - **防 SSRF**：网页抓取默认拒绝内网地址（bot 本身在局域网内，放任抓取等于暴露内网）；
 - **超时 + 截断**：所有外部调用有界，不把巨量正文灌进群；失败一律显式回应，不装死。
+
+## 无人维护：自更新 / 自检 / 长期兼容
+
+目标很直白：**服务器不需要人管**。你只改代码、推 tag，剩下的它自己做。
+
+### 一条链：tag → 构建 → 自动换版
+
+```
+本机 git push --tags v1.2.3
+   └─ .github/workflows/release.yml  先跑测试，再 zigbuild aarch64-musl
+         └─ Release 资产：webhook_server + webhook_server.sha256
+               └─ Radxa 上 qqbot-update.timer（每 10 分钟）
+                     └─ update.sh：比版本 → 下载 → sha256 校验 → 装前试执行
+                                    → 原子替换 → 重启 → 健康检查 → 失败回滚
+```
+
+`deploy/` 里的四件东西：
+
+| 文件 | 作用 |
+|------|------|
+| `qqbot.service` | 常驻服务：`Restart=always`，崩溃 60s 内超 5 次则停下（不刷爆 QQ 接口） |
+| `qqbot-update.timer` | 每 10 分钟（±60s 抖动）触发一次更新检查 |
+| `update.sh` | 更新逻辑本体，幂等：版本没变就是 no-op |
+| `install.sh` | 一次性安装：单元 + sudo 免密规则（只放行 `systemctl restart qqbot`） |
+
+### update.sh 的四道闸门（都是被真实翻车方式逼出来的）
+
+1. **sha256 对不上就不装**（fail closed）：拿不到校验文件直接放弃，拒绝安装未校验的二进制；
+2. **装前先试着跑**：新二进制先执行一次 `--version`（**不读任何密钥**），架构不符/被截断/
+   缺可执行位都在替换之前暴露，而不是替换之后；
+3. **健康检查要认版本**：重启后必须能从 `/healthz` 读到**新版本号**才算成功——
+   只探「端口通」会漏掉「重启了但还跑着旧二进制」这种最阴的情况；
+4. **失败自动回滚**：留着最近 3 份备份，回滚后再验一次健康；回滚也失败就明确喊人介入。
+
+另外：`flock` 兜住定时器与手动执行的并发；更新过程**从不写 `env.sh`**（凭证与配置永远由人掌握）。
+
+```sh
+# 更新源默认走 GitHub Releases（私有库靠 GH_TOKEN，已注入 env.sh）
+UPDATE_SOURCE=github UPDATE_REPO=lilyco-42/qq-bot-rust
+# 也可以走自建静态目录：需要 latest.txt / webhook_server / webhook_server.sha256 三个文件
+UPDATE_SOURCE=static UPDATE_BASE_URL=https://lain42.top/dl/qqbot
+```
+
+### 自检：机器人能自己说清哪里坏了
+
+- `GET /healthz` → 纯文本 `ok` + `version=` + `build=`（**部署契约**，改格式等于改协议）；
+- `--version` → 不读任何密钥即可回答，供更新脚本做装前预检；
+- `/版本` → 构建版本、运行时长、后端候选链、记忆库状态、当前话题；
+- `/自检` → 逐条接缝体检：记忆库 / 每个问答后端 / gh / gh 仓库 / 我的世界后台 / 网页抓取。
+  **硬约束：永远返回一段文本，永不 Err、永不 panic** —— 「机器人不回话」本身就是最难查的
+  故障，体检自己不能变成新的静默失败点。
+
+### zerostack 的十年兼容：只留一个可换件
+
+bot 与「模型生态」之间只有一份契约，就是 [`ask_one_backend`]：
+
+> 一个可执行文件，收 `-p <问题>`，把回答打到 stdout。仅此而已。
+
+守住这一条，任何后端都能直接顶上来：换厂商、换 CLI 名、换实现语言，都只改环境变量。
+
+```sh
+# 候选链：逗号分隔，前一个失败自动退到后一个（上游消亡时不必改代码）
+export ZEROSTACK_BIN=/home/radxa/qq_bot/zerostack_wrap.sh,zerostack,/opt/llm-cli
+```
+
+回退时打 WARN 日志（只记后端名，不记问题正文）。设计意图很清楚：
+**上游会死、会改名、会被更好的东西取代；死一个后端不该让机器人停止思考。**
 
 ## 预研结论（已验证的官方文档坑）
 
