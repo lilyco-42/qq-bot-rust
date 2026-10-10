@@ -39,7 +39,7 @@ branches = { version = "=0.4.6", default-features = false, features = ["std"], o
 # 群聊图片：图片限额、转码、Base64、结构化多模态 JSON，全部仅在 vision feature 使用。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"], optional = true }
 base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
-serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 url = { version = "2", optional = true }
 
 [features]
@@ -61,7 +61,7 @@ gateway-wtx = [
 memory = ["dep:turso", "dep:tokio", "dep:branches"]
 # 资源调用层：gh cli / 网页抓取 / Minecraft 后台（无新增依赖，复用 ureq）。
 tools = []
-vision = ["dep:image", "dep:base64", "dep:serde_json", "dep:url"]
+vision = ["dep:image", "dep:base64",  "dep:url"]
 
 [lints.cargo]
 unused_dependencies = "allow"
