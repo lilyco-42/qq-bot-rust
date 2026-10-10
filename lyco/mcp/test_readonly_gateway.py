@@ -56,6 +56,18 @@ class GatewayTest(TestCase):
         self.assertNotIn("废都区", d["mechanic"])
         self.assertEqual(lookup.call_args_list[0].args[1], "2")
 
+    def test_shortened_tool_query_keeps_known_slang_context(self):
+        sample="{{/盟约|盟约=不屈|人数=2|效果=地面干员退场时立即部署|干员=...}}"
+        with patch.object(m,"_stronghold_section",
+                          side_effect=lambda title,sec: sample if sec=="3" else ""), patch.object(m,"fetch_public",
+                              return_value="区是蛆的谐音，玩家用来表示很垃圾") as web:
+            obj=__import__("json").loads(m.stronghold_wiki_lookup({"query":"不屈"}))
+        self.assertEqual(obj["keyword"],"不屈")
+        self.assertEqual(obj["community_usage"]["source_type"],"community-provided slang")
+        self.assertIn("蛆",obj["community_usage"]["meaning"])
+        self.assertIn("不是盟约效果",obj["community_usage"]["meaning"])
+        self.assertTrue(web.called)
+
     def test_stronghold_zone_not_confused_with_slang(self):
         with patch.object(m,"fetch_public") as public:
             self.assertIsNone(m._stronghold_community_note("部署区有什么用"))
