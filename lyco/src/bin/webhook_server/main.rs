@@ -208,6 +208,8 @@ enum ReplyBody {
     Minecraft,
     /// 需要展示构建版本与运行时长（`/版本`）。
     Version,
+    /// 读取 GitHub 客户端仓库最新 Release（只读）。
+    ClientRelease,
     /// 需要对各接缝做体检（`/自检`）：记忆库 / gh / 问答后端 / 网页 / MC。
     SelfCheck,
 }
@@ -854,6 +856,20 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         // parse_message_event 已保证至少一个目标；此处保持严格，不 unwrap。
         (None, None) => return Err(LibError::NoReplyTarget),
     };
+    // QQ 图片到达时不能静默跳过，更不能假装 AI 已读图。
+    // 暂不下载附件：其 URL 属于外部不可信输入，待接入受控视觉通道后再处理。
+    if parsed.has_attachments {
+        return Ok(Some(ReplyJob {
+            is_group,
+            openid,
+            msg_id: parsed.msg_id,
+            event_type: parsed.event_type,
+            actor: parsed.user_openid.clone().unwrap_or_default(),
+            body: ReplyBody::Text(String::from(
+                "已收到图片附件，但当前机器人尚不能读取图片内容。要登记 Bug，请用 /记 描述错误信息、复现步骤、系统和客户端版本；不要仅发送截图。"
+            )),
+        }));
+    }
     let reply_body = match commands::dispatch(&parsed.content, now_unix, random)? {
         CommandReply::Text(text) => ReplyBody::Text(text),
         CommandReply::Ask(question) => ReplyBody::Ask(question),
@@ -868,6 +884,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         CommandReply::WebFetch(url) => ReplyBody::WebFetch(url),
         CommandReply::Minecraft => ReplyBody::Minecraft,
         CommandReply::Version => ReplyBody::Version,
+        CommandReply::ClientRelease => ReplyBody::ClientRelease,
         CommandReply::SelfCheck => ReplyBody::SelfCheck,
         CommandReply::Skip => return Ok(None),
     };
@@ -920,6 +937,7 @@ fn reply_worker(config: Config, body: Vec<u8>) {
         ReplyBody::WebFetch(url) => web_fetch_text(&config, url),
         ReplyBody::Minecraft => mc_status_text(&config),
         ReplyBody::Version => version_text(&config),
+        ReplyBody::ClientRelease => client_release_text(&config),
         ReplyBody::SelfCheck => self_check_text(&config),
     };
     // 观测：回复正文只在 print_events 打开时落日志（默认与事件打印同开关）。
@@ -997,10 +1015,17 @@ fn answer_question(
     let started = std::time::Instant::now();
     // 群默认话题作为上下文前缀注入：只影响送给模型的文本，
     // 沉淀进记忆的仍是用户原始问题（避免话题串污染检索）。
+    // 群聊普通问答使用 --no-tools，模型没有 gh/bash/浏览器/图片工具。
+    // 把实际能力边界逐次传给模型；避免模型虚构工具执行结果或时效性事实。
+    let capability_note = "能力边界：这是 QQ 群纯文本问答，不能读取图片附件、执行 bash/gh、\
+        浏览网页或查询实时版本。不得输出 invocation/tool_calls 等工具调用 JSON 冒充执行结果；\
+        如需 GitHub 最新版本，应明确表示未经核验并引导访问对应仓库 Release。\
+        收到图片 Bug 反馈时请让用户提供文字错误、复现步骤、系统和版本，不能声称看到了图片。\
+        对卫戍协议的活动日期、机制等未知事实不得编造。请用简短中文回答。";
     let asked = if config.topic.is_empty() {
-        question.to_string()
+        format!("{capability_note}\n群聊提问：{question}")
     } else {
-        format!("（当前群话题：{}）{}", config.topic, question)
+        format!("{capability_note}\n当前群话题：{}\n群聊提问：{question}", config.topic)
     };
     match ask_zerostack(config, &asked) {
         Ok(answer) => {
@@ -1231,6 +1256,20 @@ fn version_text(config: &Config) -> String {
         if config.topic.is_empty() { "未设置" } else { &config.topic }
     ));
     lines.join("\n")
+}
+
+/// 查询客户端仓库的真实最新 Release；不让模型猜版本号。
+#[cfg(feature = "tools")]
+fn client_release_text(config: &Config) -> String {
+    match tools::gh_client_release(&config.gh) {
+        Ok(text) => truncate_answer(&text, 600),
+        Err(err) => format!("客户端版本查询失败：{}", truncate_answer(&err, 250)),
+    }
+}
+
+#[cfg(not(feature = "tools"))]
+fn client_release_text(_config: &Config) -> String {
+    String::from("客户端版本查询未启用（需以 tools feature 构建）")
 }
 
 /// `/自检`：逐条接缝体检，告诉你「哪条通了、哪条为什么不通」。
@@ -2045,7 +2084,23 @@ fn ask_one_backend(config: &Config, bin: &str, question: &str) -> Result<String,
     if answer.is_empty() {
         return Err("empty answer on stdout".to_string());
     }
+    // 不把模型生成的「调用工具」协议当成真实执行结果发进群。
+    if looks_like_tool_invocation(&answer) {
+        return Ok(String::from(
+            "当前群聊 AI 问答不能直接执行终端或 GitHub 命令。请用 /issue <关键词> 检索仓库问题，\
+             或用 /网站 <公开URL> 查看页面；最新版本以仓库 Release 为准。",
+        ));
+    }
     Ok(truncate_answer(&answer, config.qa.max_chars))
+}
+
+/// 仅检测明显的模型工具调用协议；普通 JSON 文本不应被拦截。
+fn looks_like_tool_invocation(answer: &str) -> bool {
+    let text = answer.trim_start();
+    (text.starts_with('{') || text.starts_with(char::from(96)))
+        && (text.contains("\"invocation\"")
+            || text.contains("\"tool_calls\"")
+            || (text.contains("\"tool\"") && text.contains("\"command\"")))
 }
 
 /// 启动子进程并在超时内收集 stdout；非零退出/超时/启动失败 → Err。
@@ -2556,6 +2611,7 @@ mod tests {
             super::ReplyBody::WebFetch(url) => panic!("expected Text, got WebFetch({url})"),
             super::ReplyBody::Minecraft => panic!("expected Text, got Minecraft"),
             super::ReplyBody::Version => panic!("expected Text, got Version"),
+            super::ReplyBody::ClientRelease => panic!("expected Text, got ClientRelease"),
             super::ReplyBody::SelfCheck => panic!("expected Text, got SelfCheck"),
         }
     }
@@ -2917,6 +2973,18 @@ mod tests {
         let text = super::answer_question(&config(), "TEST", "任意问题", "scope", "actor");
         assert!(text.contains("AI 问答"), "text={text}");
         assert!(super::ask_zerostack(&config(), "q").is_err());
+    }
+
+    #[test]
+    fn rejects_phantom_tool_invocation_text() {
+        assert!(super::looks_like_tool_invocation(
+            r#"{"invocation":{"tool":"bash","command":"gh release view"}}"#
+        ));
+        assert!(super::looks_like_tool_invocation(
+            r#"{"tool_calls":[{"function":{"name":"bash"}}]}"#
+        ));
+        assert!(!super::looks_like_tool_invocation("我无法查询最新版本，建议查看 Release"));
+        assert!(!super::looks_like_tool_invocation("{\"version\":\"0.2.3\"}"));
     }
 
     #[test]

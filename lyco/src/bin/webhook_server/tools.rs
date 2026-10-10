@@ -66,6 +66,37 @@ pub fn gh_issue_search(cfg: &GhConfig, query: &str, limit: u32) -> Result<String
     Ok(text)
 }
 
+/// 查询客户端仓库最新 GitHub Release（只读、固定仓库、不执行用户提交的命令）。
+///
+/// Release 可能只发布 payload，不能把它当成全平台已可安装的客户端。
+pub fn gh_client_release(cfg: &GhConfig) -> Result<String, String> {
+    let args = vec![
+        "release".to_string(),
+        "view".to_string(),
+        "--repo".to_string(),
+        "lilyco-42/StrongholdProtocolClient".to_string(),
+        "--json".to_string(),
+        "tagName,publishedAt,url".to_string(),
+    ];
+    let raw = crate::run_capture("gh", &args, cfg.timeout).map_err(gh_hint)?;
+    render_client_release(&raw)
+}
+
+fn render_client_release(raw: &str) -> Result<String, String> {
+    let tag = json_scalar(raw, "tagName")
+        .ok_or_else(|| "GitHub 返回结果缺少 tagName，无法确认最新版本".to_string())?;
+    let url = json_scalar(raw, "url").unwrap_or_default();
+    let published = json_scalar(raw, "publishedAt").unwrap_or_else(|| "未知".to_string());
+    let note = if tag.starts_with("payload-") {
+        "注意：这是 Payload Release，不代表 Android/iOS 安装包已可下载。"
+    } else {
+        "安装包是否可用请查看 Release 的实际附件。"
+    };
+    Ok(format!(
+        "StrongholdProtocolClient 最新 Release：{tag}\n发布时间（UTC）：{published}\n{note}\n来源：{url}"
+    ))
+}
+
 /// 创建 issue（写操作，需 [`GhConfig::write_enabled`]）。
 pub fn gh_issue_create(cfg: &GhConfig, title: &str, body: &str) -> Result<String, String> {
     if !cfg.write_enabled {
@@ -117,7 +148,7 @@ pub fn mc_status(agent: &ureq::Agent, cfg: &McConfig) -> Result<String, String> 
     match crate::http_get_text(agent, &cfg.api_url) {
         Ok(body) => Ok(render_mc_status(&body)),
         Err(err) => Ok(format!(
-            "我的世界后台现在连不上（{}）。\n多半是控制台没启动：在 Radxa 上运行 radxa_console.py 后再查。",
+            "我的世界后台现在连不上（{}）。\n请检查 MINECRAFT_API_URL 指向的主机、端口和服务状态；无法确认该设备安装了什么控制台。",
             first_line(&err)
         )),
     }
@@ -344,7 +375,17 @@ mod tests {
         };
         let out = mc_status(&agent, &cfg).expect("unreachable must not be an Err");
         assert!(out.contains("连不上"), "hint missing: {out}");
-        assert!(out.contains("radxa_console"), "how-to-start missing: {out}");
+        assert!(out.contains("MINECRAFT_API_URL"), "configuration hint missing: {out}");
+        assert!(!out.contains("radxa_console.py"), "must not recommend an unverified script: {out}");
+    }
+
+    #[test]
+    fn client_release_distinguishes_payload_from_installer() {
+        let input = r#"{"tagName":"payload-v0.2.3-c33","publishedAt":"2026-10-10T06:09:18Z","url":"https://github.com/lilyco-42/StrongholdProtocolClient/releases/tag/payload-v0.2.3-c33"}"#;
+        let out = super::render_client_release(input).unwrap();
+        assert!(out.contains("payload-v0.2.3-c33"));
+        assert!(out.contains("不代表 Android/iOS 安装包"));
+        assert!(out.contains("https://github.com/"));
     }
 
     /// HTML 摘要：抽出标题并剥掉标签。
