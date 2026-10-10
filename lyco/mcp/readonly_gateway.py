@@ -332,7 +332,8 @@ def _stronghold_community_note(query):
     return {
         "term": "区", "definition": content[:650],
         "source_url": citation, "source_type": "community-provided slang",
-        "meaning": "homophone of 蛆, expressing a subjective '垃圾/很弱' opinion",
+        "meaning": "区是蛆的谐音，是玩家说某玩法很垃圾／很弱的主观差评；不是盟约效果或阵容名称",
+        "applies_to": "Use only when interpreting chat slang such as 不屈是区; not a game-balance conclusion",
         "not_a_mechanic": True,
         "caution": "The phrase '不屈是区' states a negative opinion, not verified game balance."
     }
@@ -354,6 +355,12 @@ def stronghold_wiki_lookup(args):
             if end < 0 or end - start > 2800:
                 continue
             mechanic = _stronghold_plain(wiki[start:end])[:1450]
+            # ZeroStack may shorten a compound chat question like "不屈是区"
+            # to merely "不屈" when invoking this MCP. Preserve the associated
+            # community explanation for this specific alliance even then.
+            relevant_slang = community
+            if keyword == "不屈" and relevant_slang is None:
+                relevant_slang = _stronghold_community_note("不屈是区")
             return json.dumps({
                 "topic": "盟约机制", "keyword": keyword,
                 "required_operators": int(m.group(2)),
@@ -361,7 +368,7 @@ def stronghold_wiki_lookup(args):
                 "source_title": title,
                 "source_url": "https://prts.wiki/w/" + urllib.parse.quote(title, safe="/:"),
                 "evidence_limit": "This PRTS section documents a mechanism, not player slang or game balance.",
-                "community_usage": community
+                "community_usage": relevant_slang
             }, ensure_ascii=False)
     title, sec, section = _STRONGHOLD_GUIDE
     wiki = _stronghold_section(title, sec)
