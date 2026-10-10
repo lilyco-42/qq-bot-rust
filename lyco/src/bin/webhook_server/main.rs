@@ -856,6 +856,20 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
         // parse_message_event 已保证至少一个目标；此处保持严格，不 unwrap。
         (None, None) => return Err(LibError::NoReplyTarget),
     };
+    // QQ 图片到达时不能静默跳过，更不能假装 AI 已读图。
+    // 暂不下载附件：其 URL 属于外部不可信输入，待接入受控视觉通道后再处理。
+    if parsed.has_attachments {
+        return Ok(Some(ReplyJob {
+            is_group,
+            openid,
+            msg_id: parsed.msg_id,
+            event_type: parsed.event_type,
+            actor: parsed.user_openid.clone().unwrap_or_default(),
+            body: ReplyBody::Text(String::from(
+                "已收到图片附件，但当前机器人尚不能读取图片内容。要登记 Bug，请用 /记 描述错误信息、复现步骤、系统和客户端版本；不要仅发送截图。"
+            )),
+        }));
+    }
     let reply_body = match commands::dispatch(&parsed.content, now_unix, random)? {
         CommandReply::Text(text) => ReplyBody::Text(text),
         CommandReply::Ask(question) => ReplyBody::Ask(question),
