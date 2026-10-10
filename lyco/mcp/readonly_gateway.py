@@ -309,8 +309,16 @@ def _stronghold_community_note(query):
     This record is community-provided language, NOT sourced from PRTS and
     NOT a numerical judgment about the strength of an alliance.
     """
-    if not ("蛆" in query or "是区" in query or "很区" in query or
-            "区是什么意思" in query or ("不屈" in query and "区" in query)):
+    # Compound gameplay words containing 区 refer to a physical game zone,
+    # never to the derogatory slang. Respect an explicit separate slang phrase.
+    physical_zone = any(term in query for term in (
+        "部署区", "整备区", "备战区", "准备区", "战斗区", "区域", "地理区"))
+    explicit_slang = any(term in query for term in (
+        "是区", "很区", "区吗", "区这个词", "区这个梗", "蛆"))
+    if physical_zone and not explicit_slang:
+        return None
+    if not (explicit_slang or "区是什么意思" in query or
+            ("不屈" in query and "区" in query and not physical_zone)):
         return None
     url = ("https://raw.githubusercontent.com/lilyco-42/"
            "stronghold-knowledge/main/terms/%E5%8C%BA.md")
@@ -365,7 +373,9 @@ def stronghold_wiki_lookup(args):
         "topic": "卫戍协议玩法", "query": query,
         "source_title": title, "section": section,
         "source_url": "https://prts.wiki/w/" + urllib.parse.quote(title, safe="/:"),
-        "guide_excerpt": text[:1750],
+        # Keep serialized tool JSON inside MAX_OUTPUT even with community
+        # provenance included; never clip JSON mid-string in tools/call.
+        "guide_excerpt": text[:1250 if community is None else 850],
         "evidence_limit": "General PRTS gameplay guidance only. Do not invent memes, motives or bug fixes.",
         "community_usage": community
     }, ensure_ascii=False)
