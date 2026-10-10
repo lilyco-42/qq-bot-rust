@@ -28,6 +28,8 @@ pub struct MessageEvent {
     pub msg_id: String,
     /// 消息正文（`d.content`，已解码 JSON 转义；可能为空串）。
     pub content: String,
+    /// QQ 事件是否包含非空 attachments 数组（不暴露附件 URL）。
+    pub has_attachments: bool,
     /// 发送者 openid（`d.author.user_openid`）：单聊回复目标。
     pub user_openid: Option<String>,
     /// 群 openid（`d.group_openid`）：群聊回复目标。
@@ -66,6 +68,7 @@ pub fn parse_message_event(body: &[u8], event_type: &str) -> Result<MessageEvent
         .ok_or(Error::MissingField("d.id"))?;
     // content 可缺省（媒体消息）；存在但形态非法则上抛。
     let content = json_top_text(d, b"content")?.unwrap_or_default();
+    let has_attachments = has_nonempty_attachments(d);
     let group_openid = json_top_text(d, b"group_openid")?;
     // author 缺失 = 无 user_openid（不报错，由目标完整性检查兜底）；
     // author 存在但 user_openid 形态非法 → 错误上抛，不吞。
@@ -83,9 +86,25 @@ pub fn parse_message_event(body: &[u8], event_type: &str) -> Result<MessageEvent
         event_type: String::from(event_type),
         msg_id,
         content,
+        has_attachments,
         user_openid,
         group_openid,
     })
+}
+
+/// 不信任群聊的任意外链，也不提取图片 URL；只探知 attachments 非空。
+fn has_nonempty_attachments(event_data: &[u8]) -> bool {
+    let needle = b"\"attachments\"";
+    let Some(at) = event_data.windows(needle.len()).position(|part| part == needle) else {
+        return false;
+    };
+    let rest = &event_data[at + needle.len()..];
+    let rest = rest.iter().copied().skip_while(u8::is_ascii_whitespace).collect::<alloc::vec::Vec<_>>();
+    if rest.first() != Some(&b':') { return false; }
+    let rest = rest[1..].iter().copied().skip_while(u8::is_ascii_whitespace).collect::<alloc::vec::Vec<_>>();
+    if rest.first() != Some(&b'[') { return false; }
+    let rest = rest[1..].iter().copied().skip_while(u8::is_ascii_whitespace).collect::<alloc::vec::Vec<_>>();
+    !matches!(rest.first(), None | Some(b']'))
 }
 
 #[cfg(test)]
@@ -192,6 +211,16 @@ mod tests {
             ),
             Err(Error::MalformedJson)
         );
+    }
+
+    #[test]
+    fn detects_group_image_attachments_without_download() {
+        let body = br#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"m","group_openid":"g","content":"帮我记录这个 bug","attachments":[{"content_type":"image/png","url":"https://example.invalid/a.png"}]}}"#;
+        let ev = parse_message_event(body, MSG_GROUP_AT).unwrap();
+        assert!(ev.has_attachments);
+        assert_eq!(ev.content, "帮我记录这个 bug");
+        let empty = br#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"m","group_openid":"g","attachments":[]}}"#;
+        assert!(!parse_message_event(empty, MSG_GROUP_AT).unwrap().has_attachments);
     }
 
     #[test]
