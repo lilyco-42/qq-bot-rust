@@ -48,6 +48,8 @@ pub enum Reply {
     Minecraft,
     /// 需要展示构建版本与运行时长（`/版本`）。
     Version,
+    /// 只读查询客户端仓库最新 Release（区别于机器人自身版本）。
+    ClientRelease,
     /// 需要逐条接缝体检（`/自检`）：记忆库 / 问答后端 / gh / 网页 / MC。
     ///
     /// 与其它意图同样只声明：真正的探测在接收端（无 IO 是这一层的契约）。
@@ -70,6 +72,9 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
     }
     // 指令必须以 `/` 开头；无前缀的普通消息交给 AI 问答。
     let Some(after_slash) = text.strip_prefix('/') else {
+        if text.contains("客户端") && (text.contains("最新版本") || text.contains("版本号")) {
+            return Ok(Reply::ClientRelease);
+        }
         return Ok(Reply::Ask(text.to_string()));
     };
     // 指令 = 斜杠后首个空白分隔 token。
@@ -102,6 +107,7 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "mc" | "我的世界" | "minecraft" => Reply::Minecraft,
         // 运维自省：版本与体检（排障入口，不要求群成员懂服务器）。
         "版本" | "version" => Reply::Version,
+        "客户端版本" | "最新版本" | "clientversion" => Reply::ClientRelease,
         "自检" | "体检" | "健康" | "selfcheck" | "health" => Reply::SelfCheck,
         _ => Reply::Text(String::from("未识别指令。发送「/帮助」查看可用指令")),
     };
@@ -126,6 +132,7 @@ fn help_text() -> String {
          /网站 <url> — 抓取网页正文\n\
          /mc — 我的世界服务器状态\n\
          /版本 — 构建版本与运行时长\n\
+         /客户端版本 — 查询 GitHub 客户端仓库最新 Release\n\
          /自检 — 各接缝体检（记忆/问答/gh/网页/MC）\n\
          /关于 — 版本信息\n\
          直接发文字可向 AI 提问",
@@ -369,6 +376,13 @@ mod tests {
             panic!("帮助 must reply");
         };
         assert!(text.contains("/房间"), "help missing /房间: {text}");
+    }
+
+    #[test]
+    fn client_version_query_uses_readonly_intent() {
+        assert_eq!(dispatch("/客户端版本", 0, 0).unwrap(), Reply::ClientRelease);
+        assert_eq!(dispatch("手机客户端最新版本是什么", 0, 0).unwrap(), Reply::ClientRelease);
+        assert!(matches!(dispatch("客户端怎么安装", 0, 0).unwrap(), Reply::Ask(_)));
     }
 
     #[test]
