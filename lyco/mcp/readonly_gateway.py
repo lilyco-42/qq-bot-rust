@@ -49,6 +49,11 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string", "minLength": 1, "maxLength": 100}},
          "required": ["title"], "additionalProperties": False}},
+    {"name": "stronghold_wiki_lookup",
+     "description": "PRIMARY reference for 卫戍协议 gameplay, alliance mechanics, 不屈 and strategy. Directly reads the fixed PRTS Wiki 卫戍协议 pages; use this BEFORE generic GitHub issue search for game mechanisms. Does NOT verify community jokes or slang.",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "minLength": 1, "maxLength": 80}},
+         "required": ["query"], "additionalProperties": False}},
     {"name": "game_status",
      "description": "Read only public sp.lain42.top game /healthz status; do not log in or use credentials.",
      "inputSchema": {"type": "object", "properties": {},
@@ -271,6 +276,101 @@ def prts_page(args):
                       ensure_ascii=False)
 
 
+# Fixed read-only PRTS page/section references. No caller-provided URLs.
+_STRONGHOLD_GUIDE = ("卫戍协议", "6", "模拟流程")
+_STRONGHOLD_ALLIANCES = (
+    ("卫戍协议：盟约/PRTS盟约记录", "2", "核心盟约"),
+    ("卫戍协议：盟约/PRTS盟约记录", "3", "附加盟约"),
+)
+
+
+def _stronghold_section(title, section):
+    obj = _prts_api({"action": "parse", "page": title, "prop": "wikitext",
+                     "section": section})
+    return obj.get("parse", {}).get("wikitext", {}).get("*", "")
+
+
+def _stronghold_plain(value):
+    value = re.sub(r"(?i)<(?:br|hr)\s*/?>", "； ", value)
+    value = re.sub(r"\{\{修正\|([^|{}]+)\|[^{}]*\}\}", r"\1", value)
+    for _ in range(5):
+        updated = re.sub(r"\{\{color\|[^|{}]*\|([^{}]*)\}\}", r"\1",
+                         value, flags=re.IGNORECASE)
+        if updated == value:
+            break
+        value = updated
+    value = re.sub(r"\[\[(?:[^]|]+\|)?([^]]+)\]\]", r"\1", value)
+    return re.sub(r"[ \t]{2,}", " ", value).strip()
+
+
+def _stronghold_community_note(query):
+    """Only clarify slang when the wording makes it relevant.
+
+    This record is community-provided language, NOT sourced from PRTS and
+    NOT a numerical judgment about the strength of an alliance.
+    """
+    if not ("蛆" in query or "是区" in query or "很区" in query or
+            "区是什么意思" in query or ("不屈" in query and "区" in query)):
+        return None
+    url = ("https://raw.githubusercontent.com/lilyco-42/"
+           "stronghold-knowledge/main/terms/%E5%8C%BA.md")
+    citation = ("https://github.com/lilyco-42/"
+                "stronghold-knowledge/blob/main/terms/%E5%8C%BA.md")
+    try:
+        content = fetch_public(url)
+    except (RuntimeError, ValueError, OSError, urllib.error.URLError):
+        return {"term": "区", "error": "Community glossary temporarily unavailable",
+                "source_url": citation, "source_type": "community, not PRTS"}
+    return {
+        "term": "区", "definition": content[:650],
+        "source_url": citation, "source_type": "community-provided slang",
+        "meaning": "homophone of 蛆, expressing a subjective '垃圾/很弱' opinion",
+        "not_a_mechanic": True,
+        "caution": "The phrase '不屈是区' states a negative opinion, not verified game balance."
+    }
+
+
+def stronghold_wiki_lookup(args):
+    query = _prts_title(args.get("query", ""), 80)
+    community = _stronghold_community_note(query)
+    # Read exact documented alliance templates rather than inventing text
+    # from unrelated issue comments or the user's slang.
+    for title, sec, section in _STRONGHOLD_ALLIANCES:
+        wiki = _stronghold_section(title, sec)
+        for m in re.finditer(r"\{\{/盟约\|盟约=([^|}]{1,15})\|人数=(\d+)\|效果=", wiki):
+            keyword = m.group(1).strip()
+            if keyword not in query:
+                continue
+            start = m.end()
+            end = wiki.find("|干员=", start)
+            if end < 0 or end - start > 2800:
+                continue
+            mechanic = _stronghold_plain(wiki[start:end])[:1450]
+            return json.dumps({
+                "topic": "盟约机制", "keyword": keyword,
+                "required_operators": int(m.group(2)),
+                "mechanic": mechanic, "section": section,
+                "source_title": title,
+                "source_url": "https://prts.wiki/w/" + urllib.parse.quote(title, safe="/:"),
+                "evidence_limit": "This PRTS section documents a mechanism, not player slang or game balance.",
+                "community_usage": community
+            }, ensure_ascii=False)
+    title, sec, section = _STRONGHOLD_GUIDE
+    wiki = _stronghold_section(title, sec)
+    if not wiki:
+        raise RuntimeError("PRTS simulation guide unavailable")
+    text = _stronghold_plain(wiki)
+    text = re.sub(r"\{\{[^{}]{0,220}\}\}", "", text)
+    return json.dumps({
+        "topic": "卫戍协议玩法", "query": query,
+        "source_title": title, "section": section,
+        "source_url": "https://prts.wiki/w/" + urllib.parse.quote(title, safe="/:"),
+        "guide_excerpt": text[:1750],
+        "evidence_limit": "General PRTS gameplay guidance only. Do not invent memes, motives or bug fixes.",
+        "community_usage": community
+    }, ensure_ascii=False)
+
+
 def dispatch(name, args):
     if not isinstance(args, dict):
         raise ValueError("Tool arguments must be an object")
@@ -284,6 +384,8 @@ def dispatch(name, args):
         return prts_search(args)
     if name == "prts_page":
         return prts_page(args)
+    if name == "stronghold_wiki_lookup":
+        return stronghold_wiki_lookup(args)
     if name == "game_status":
         return fetch_public("https://sp.lain42.top/healthz")
     if name == "public_page":
