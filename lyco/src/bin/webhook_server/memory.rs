@@ -460,8 +460,10 @@ mod tests {
     #[test]
     fn trivial_fades_far_faster_than_important() {
         let day = 86_400_i64;
-        let trivial = decayed(1.0, 0.3, 0, day); // 半衰期 ≈0.63 天
-        let important = decayed(1.0, 2.0, 0, day); // 半衰期 ≈28 天
+        // 用 3 天拉开平方重要度的衰减差：0.3 的有效强度约 0.037，
+        // 2.0 的约 0.928。原测试只经过 1 天却要求 trivial < 0.1，数学上不成立。
+        let trivial = decayed(1.0, 0.3, 0, 3 * day); // 半衰期 ≈0.63 天
+        let important = decayed(1.0, 2.0, 0, 3 * day); // 半衰期 ≈28 天
         assert!(trivial < 0.1, "trivial should fade fast: {trivial}");
         assert!(important > 0.9, "important should persist: {important}");
         assert!(important > trivial * 10.0);
