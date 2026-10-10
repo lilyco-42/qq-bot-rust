@@ -1446,6 +1446,7 @@ dependencies = [
 name = "qq_bot_rust"
 version = "0.1.0"
 dependencies = [
+ "branches",
  "ed25519-dalek",
  "httparse",
  "tokio",
