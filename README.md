@@ -2,6 +2,22 @@
 
 Radxa ARM64 QQ bot, webhook gateway and public GitHub Actions releases.
 
+## 最新客户端下载（群内自然语言）
+
+群友真正 `@lyco` 后，发送「网盘链接」「哪里下载」「安卓APK下载链接」
+或 `/下载`，机器人走确定性的 GitHub 客户端 Release 查询，
+回复公开夸克网盘文件夹与当前正式版的 GitHub 链接，不靠模型猜网址。
+公开文件夹：https://pan.quark.cn/s/eb08795d014c
+
+普通的 ZeroStack AI 问答也可以读取运营方维护的**本地只读知识条目**。
+Radxa 服务环境可设置：
+`BOT_KNOWLEDGE_FILE=/home/radxa/qq_bot/knowledge.md`。
+知识条目的上游存于
+[卫戍知识库的客户端条目](https://github.com/lilyco-42/stronghold-knowledge/blob/main/downloads/client.md)；
+建议从该仓库同步到上述本地路径（仅运营方有写权限），无需开放群友知识库写权限。
+机器人每次普通问答读取前 1800 字，不在日志打印知识全文。
+最新版本必须查询 GitHub，不可把知识条目的历史版本快照当作实时信息。
+
 
 ## QQ group images and OCR
 

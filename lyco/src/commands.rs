@@ -125,7 +125,17 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
             || text.contains("安装包")
             || text.contains("安卓版")
             || text.contains("APK");
-        if asks_client_release
+        // 玩家可直接问「网盘链接」「哪里下载」：无需模型猜测分享地址。
+        // 这里仍由真实的 GitHub Release 查询生成答复，包含运营方公开的夸克文件夹。
+        let asks_download_link = [
+            "网盘链接", "网盘地址", "夸克链接", "夸克网盘",
+            "下载链接", "下载地址", "哪里下载", "在哪下载",
+            "从哪下载", "去哪下载", "怎么下载", "求安装包",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+            || matches!(text, "下载" | "网盘" | "链接");
+        let asks_client_update = asks_client_release
             && (text.contains("最新版本")
                 || text.contains("版本号")
                 || text.contains("发版")
@@ -134,7 +144,8 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
                 || text.contains("出了吗")
                 || text.contains("好了么")
                 || text.contains("好了吗")
-                || lower.contains("release"))
+                || lower.contains("release"));
+        if asks_download_link || asks_client_update
         {
             return Ok(Reply::ClientRelease);
         }
@@ -185,7 +196,7 @@ pub fn dispatch(content: &str, clock: Clock, random: u64) -> Result<Reply> {
         "mc" | "我的世界" | "minecraft" => Reply::Minecraft,
         // 运维自省：版本与体检（排障入口，不要求群成员懂服务器）。
         "版本" | "version" => Reply::Version,
-        "客户端版本" | "最新版本" | "clientversion" => Reply::ClientRelease,
+        "客户端版本" | "最新版本" | "clientversion" | "下载" | "网盘" | "download" => Reply::ClientRelease,
         "自检" | "体检" | "健康" | "selfcheck" | "health" => Reply::SelfCheck,
         _ => Reply::Text(String::from("未识别指令。发送「/帮助」查看可用指令")),
     };
@@ -214,6 +225,7 @@ fn help_text() -> String {
          /mc — 我的世界服务器状态\n\
          /版本 — 构建版本与运行时长\n\
          /客户端版本 — 查询 GitHub 客户端仓库最新 Release\n\
+         /下载 — 最新客户端安装包与夸克网盘地址\n\
          /自检 — 各接缝体检（记忆/问答/gh/网页/MC）\n\
          /关于 — 版本信息\n\
          直接发文字可向 AI 提问",
@@ -532,6 +544,15 @@ mod tests {
             "客户端发版了吗",
             "安卓客户端发布了吗？",
             "安装包下载地址",
+            "有没有夸克网盘链接",
+            "求最新网盘链接",
+            "卫戍协议去哪下载",
+            "安卓APK下载链接",
+            "给我下载地址",
+            "怎么下载",
+            "链接",
+            "/下载",
+            "/网盘",
         ] {
             assert_eq!(
                 dispatch(question, 0, 0).unwrap(),
@@ -541,6 +562,10 @@ mod tests {
         }
         assert!(matches!(
             dispatch("客户端怎么安装", 0, 0).unwrap(),
+            Reply::Ask(_)
+        ));
+        assert!(matches!(
+            dispatch("不屈盟约怎么搭配", 0, 0).unwrap(),
             Reply::Ask(_)
         ));
     }
