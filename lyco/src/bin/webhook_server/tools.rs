@@ -120,7 +120,7 @@ fn render_client_release(raw: &str) -> Result<String, String> {
     let published = entry["publishedAt"].as_str().unwrap_or("未知");
     let url = format!("https://github.com/lilyco-42/StrongholdProtocolClient/releases/tag/{tag}");
     Ok(format!(
-        "卫戍协议客户端正式版 {tag} 已发布。\n发布时间（UTC）：{published}\nAndroid APK、Windows、iOS 等下载请查看 Release 附件（iOS 未签名，Android 3D 尚待真机验收）。\n{url}"
+        "卫戍协议客户端正式版 {tag} 已发布。\n发布时间（UTC）：{published}\nGitHub Release（Android / Windows / iOS）：{url}\n夸克网盘公开文件夹「明日方舟卫戍协议」：https://pan.quark.cn/s/eb08795d014c\n网盘可能存在同步延迟，请在文件夹内核对版本；iOS 未签名，Android 3D 尚待真机验收。"
     ))
 }
 
@@ -432,6 +432,10 @@ mod tests {
         assert!(!out.contains("payload-v0.2.3-c39"));
         assert!(!out.contains("v0.2.3-c40"));
         assert!(out.contains("/releases/tag/v0.2.3-c38"));
+        // This is a public share of a *folder* in Quark, not a single
+        // installer download URL or a private owner-only cloud FID.
+        assert!(out.contains("夸克网盘公开文件夹「明日方舟卫戍协议」"));
+        assert!(out.contains("https://pan.quark.cn/s/eb08795d014c"));
         assert!(super::is_player_release_tag("v0.2.3-c38"));
         assert!(!super::is_player_release_tag("payload-v0.2.3-c38"));
     }
