@@ -911,7 +911,7 @@ fn plan_reply(body: &[u8], now_unix: i64, random: u64) -> Result<Option<ReplyJob
             event_type: parsed.event_type,
             actor: parsed.user_openid.clone().unwrap_or_default(),
             body: ReplyBody::Text(String::from(
-                "已收到图片附件，但当前机器人尚不能读取图片内容。要登记 Bug，请用 /记 描述错误信息、复现步骤、系统和客户端版本；不要仅发送截图。",
+                "这条消息里有附件或引用，但 QQ 未提供可读取的图片链接。请直接引用原图片并 @lyco 提问，或把图片与问题放在同一条消息发送；无需改用 /记。",
             )),
         }));
     }
@@ -3054,6 +3054,22 @@ mod tests {
                 assert_eq!(question, "What error?");
             }
             _ => panic!("expected multimodal image job"),
+        }
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn qq_quoted_screenshot_reaches_vision_instead_of_old_fallback() {
+        // Regression: QQ attaches a referenced screenshot in msg_elements,
+        // while the current @lyco question only has text.
+        let body = r#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"current-id","group_openid":"group","message_type":103,"content":"这张滚木截图是什么 Bug？","msg_elements":[{"content":"","attachments":[{"content_type":"image/jpeg","url":"https://gchat.qpic.cn/qq-quoted-screenshot"}]}]}}"#.as_bytes();
+        let job = super::plan_reply(body, 0, 0).unwrap().unwrap();
+        match job.body {
+            super::ReplyBody::ImageQa { url, question } => {
+                assert_eq!(url, "https://gchat.qpic.cn/qq-quoted-screenshot");
+                assert_eq!(question, "这张滚木截图是什么 Bug？");
+            }
+            _ => panic!("quoted screenshot must reach vision pipeline"),
         }
     }
 
