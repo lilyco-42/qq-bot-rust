@@ -15,10 +15,27 @@ const MAX_PIXELS: u64 = 14_000_000;
 const MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-/// Only the first genuine image attachment can trigger one bounded request.
+/// Find one bounded, trusted image attachment. Quoted QQ messages (type 103)
+/// carry the referenced message under d.msg_elements[*].attachments rather
+/// than d.attachments. A separate prior message cannot be fetched here.
 pub fn extract_image_url(event: &[u8]) -> Option<String> {
     let event: Value = serde_json::from_slice(event).ok()?;
-    let attachments = event.get("d")?.get("attachments")?.as_array()?;
+    let data = event.get("d")?;
+    if let Some(url) = image_from_attachments(data.get("attachments")) {
+        return Some(url);
+    }
+    // QQ's quote/reply event embeds the original message's attachments in
+    // msg_elements. Bound both the number of quoted elements and attachments.
+    for element in data.get("msg_elements")?.as_array()?.iter().take(4) {
+        if let Some(url) = image_from_attachments(element.get("attachments")) {
+            return Some(url);
+        }
+    }
+    None
+}
+
+fn image_from_attachments(value: Option<&Value>) -> Option<String> {
+    let attachments = value?.as_array()?;
     for att in attachments.iter().take(4) {
         let Some(url) = att.get("url").and_then(Value::as_str) else {
             continue;
@@ -27,10 +44,12 @@ pub fn extract_image_url(event: &[u8]) -> Option<String> {
             .get("content_type")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // QQ often sends signed, extensionless URLs without a content_type.
-        // CDN origin is the security boundary; image magic is checked after download.
-        // Do not reject real screenshots just because an optional hint is missing.
-        if content_type.starts_with("video/") || content_type.starts_with("audio/") {
+        // QQ sometimes omits both the extension and MIME. Image magic is
+        // verified after download; never fetch arbitrary external origins.
+        if content_type.starts_with("video/")
+            || content_type.starts_with("audio/")
+            || (content_type != "" && !content_type.starts_with("image/"))
+        {
             continue;
         }
         if is_trusted_image_url(url) {
@@ -255,6 +274,26 @@ mod tests {
         let non_image = br#"{"d":{"attachments":[{"content_type":"video/mp4","url":"https://gchat.qpic.cn/file"}]}}"#;
         assert_eq!(extract_image_url(non_image), None);
     }
+
+    #[test]
+    fn quoted_image_from_msg_elements_uses_trusted_cdn_only() {
+        // QQ sends the screenshot in the quoted element (message_type=103);
+        // the current user's @lyco question has no top-level image.
+        let quoted = r#"{"t":"GROUP_AT_MESSAGE_CREATE","d":{"message_type":103,"content":"这张滚木截图是什么 Bug？","msg_elements":[{"content":"[picture]","attachments":[{"url":"https://gchat.qpic.cn/quoted/roll-log","content_type":"image/png"}]}]}}"#.as_bytes();
+        assert_eq!(
+            extract_image_url(quoted).as_deref(),
+            Some("https://gchat.qpic.cn/quoted/roll-log")
+        );
+        // A non-image attachment must not mask the quoted screenshot.
+        let with_video = br#"{"d":{"attachments":[{"content_type":"video/mp4","url":"https://gchat.qpic.cn/clip"}],"msg_elements":[{"attachments":[{"content_type":"image/jpeg","url":"https://multimedia.nt.qq.com/quoted-img"}]}]}}"#;
+        assert_eq!(
+            extract_image_url(with_video).as_deref(),
+            Some("https://multimedia.nt.qq.com/quoted-img")
+        );
+        let untrusted = br#"{"d":{"message_type":103,"msg_elements":[{"attachments":[{"content_type":"image/png","url":"https://evil.invalid/image.png"}]}]}}"#;
+        assert_eq!(extract_image_url(untrusted), None);
+    }
+
     #[test]
     fn image_magic_and_size_checked() {
         assert!(normalise_image(b"<html>fake image</html>").is_err());
