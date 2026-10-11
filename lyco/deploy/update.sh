@@ -105,10 +105,12 @@ remote_version() {
       # 没有 gh 就用 API（私有库要 token；公开库不需要）。
       local auth=()
       [ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+      # 注意：sub 的正则必须锚定前缀（^[^:]*:…），否则贪婪的 /.*"/
+      # 会把整个匹配吃到只剩空串，导致永远解析不出远端版本。
       curl -fsS --max-time "$UPDATE_TIMEOUT" "${auth[@]}" \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" |
-        awk 'match($0,/"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/){v=substr($0,RSTART,RLENGTH);sub(/.*"/,"",v);sub(/"$/,"",v);print v;exit}'
+        awk 'match($0,/"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/){v=substr($0,RSTART,RLENGTH);sub(/^[^:]*:[[:space:]]*"/,"",v);sub(/"$/,"",v);print v;exit}'
     fi
     ;;
   static)
